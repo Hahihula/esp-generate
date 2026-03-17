@@ -25,6 +25,7 @@ use strum::IntoEnumIterator;
 use taplo::formatter::Options;
 
 use crate::template_files::TEMPLATE_FILES;
+use esp_generate::template_embed;
 
 mod check;
 mod module_selector;
@@ -33,6 +34,8 @@ mod toolchain;
 mod tui;
 
 static TEMPLATE: LazyLock<Template> = LazyLock::new(|| {
+    // Note: TEMPLATE is initialized at compile time, so it always uses the built-in template.
+    // When --bsp is used, we use the runtime `template_files` variable instead.
     serde_yaml::from_str(
         template_files::TEMPLATE_FILES
             .iter()
@@ -48,9 +51,15 @@ struct Args {
     /// Name of the project to generate
     name: Option<String>,
 
-    /// Chip to target
-    #[arg(short, long)]
+    /// Chip to target (mutually exclusive with --bsp)
+    #[arg(short, long, conflicts_with = "bsp")]
     chip: Option<Chip>,
+
+    /// Board Support Package path or name (mutually exclusive with --chip)
+    /// If a valid local path, uses that as template source.
+    /// If not a valid path, downloads from git repository (not yet implemented).
+    #[arg(long, conflicts_with = "chip")]
+    bsp: Option<String>,
 
     /// Run in headless mode (i.e. do not use the TUI)
     #[arg(long)]
@@ -159,6 +168,23 @@ fn main() -> Result<()> {
 
     let mut args = Args::parse();
 
+    // Handle --bsp argument
+    let bsp_template_files: Option<&[(&str, &str)]> = if let Some(bsp) = &args.bsp {
+        let bsp_path = Path::new(bsp);
+        if bsp_path.exists() && bsp_path.is_dir() {
+            // Use local path as template source
+            Some(template_embed::embed_templates_from_path(bsp_path))
+        } else {
+            // Not a valid local path - assume it's a BSP name for git download (not implemented)
+            unimplemented!("BSP '{}' is not a valid local path. Git repository download not yet implemented.", bsp);
+        }
+    } else {
+        None
+    };
+
+    // Determine which template files to use
+    let template_files = bsp_template_files.unwrap_or(TEMPLATE_FILES);
+
     // Only check for updates once the command-line arguments have been processed,
     // to avoid printing any update notifications when the help message is
     // displayed.
@@ -168,13 +194,27 @@ fn main() -> Result<()> {
     }
 
     // Run the interactive TUI only if chip or name is missing
-    if args.chip.is_none() || args.name.is_none() {
+    // Skip interactive chip selection when using --bsp (chip comes from template)
+    if args.bsp.is_none() && (args.chip.is_none() || args.name.is_none()) {
         setup_args_interactive(&mut args)?;
     }
 
-    let chip = args.chip.unwrap();
+    // When using --bsp, get chip from template; otherwise use CLI argument
+    let chip = if args.bsp.is_some() {
+        get_chip_from_bsp_template(template_files)
+    } else {
+        args.chip.unwrap()
+    };
 
-    let name = args.name.clone().unwrap();
+    // Name is always required - prompt interactively if not provided
+    let name = if let Some(name) = args.name.clone() {
+        name
+    } else {
+        let project_name = inquire::Text::new("Enter project name:")
+            .with_default("my-esp-project")
+            .prompt()?;
+        project_name
+    };
 
     let path = &args
         .output_path
@@ -190,7 +230,7 @@ fn main() -> Result<()> {
     }
 
     let versions = cargo::CargoToml::load(
-        TEMPLATE_FILES
+        template_files
             .iter()
             .find(|(k, _)| *k == "Cargo.toml")
             .expect("Cargo.toml not found in template")
@@ -444,7 +484,7 @@ fn main() -> Result<()> {
     let project_dir = path.join(&name);
     fs::create_dir(&project_dir)?;
 
-    for &(file_path, contents) in template_files::TEMPLATE_FILES.iter() {
+    for &(file_path, contents) in template_files.iter() {
         let mut file_path = file_path.to_string();
         if let Some(processed) = process_file(contents, &selected, &variables, &mut file_path) {
             let file_path = project_dir.join(file_path);
@@ -500,6 +540,17 @@ fn main() -> Result<()> {
     );
 
     Ok(())
+}
+
+/// Extracts the chip specification from the BSP template's JSON files.
+///
+/// TODO: Read chip specification from JSON files in the template root.
+/// For now, returns a placeholder constant.
+fn get_chip_from_bsp_template(_template_files: &[(&str, &str)]) -> Chip {
+    // TODO: Parse JSON files in template root to find chip specification
+    // For now, return a placeholder - this will be implemented to read from
+    // BSP's template.yaml or a separate chip-spec.json file
+    Chip::Esp32c6
 }
 
 fn remove_incompatible_chip_options(chip: Chip, options: &mut Vec<GeneratorOptionItem>) {

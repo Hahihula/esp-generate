@@ -2,11 +2,20 @@
 ///
 /// Returns a static slice of tuples containing (relative_path, file_content).
 pub fn embed_templates() -> &'static [(&'static str, &'static str)] {
+    embed_templates_from_path(&std::path::Path::new("template"))
+}
+
+/// Embeds template files from a custom directory path.
+///
+/// Returns a static slice of tuples containing (relative_path, file_content).
+pub fn embed_templates_from_path(
+    template_path: &std::path::Path,
+) -> &'static [(&'static str, &'static str)] {
     let cwd = std::env::current_dir().unwrap().canonicalize().unwrap();
     let cwd = cwd.to_str().unwrap();
     let mut files: Vec<(&'static str, &'static str)> = Vec::new();
 
-    for file in walkdir::WalkDir::new("template") {
+    for file in walkdir::WalkDir::new(template_path) {
         let path = file.unwrap();
 
         if !path.file_type().is_file() {
