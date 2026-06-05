@@ -1,5 +1,8 @@
 fn main() {
     linker_be_nice();
+    //IF option("xtensa")
+    check_xtensa_linker_available();
+    //ENDIF
     //IF option("embedded-test")
     println!("cargo:rustc-link-arg-tests=-Tembedded-test.x");
     //ENDIF
@@ -10,6 +13,69 @@ fn main() {
     println!("cargo:rustc-link-arg=-Tlinkall.x");
 }
 
+//IF option("xtensa")
+#[cfg(unix)]
+fn check_xtensa_linker_available() {
+    println!("cargo:rerun-if-env-changed=PATH");
+
+    let target = std::env::var("TARGET").unwrap_or_default();
+    println!(
+        "cargo:rerun-if-env-changed={}",
+        cargo_linker_env_var(&target)
+    );
+
+    let linker = xtensa_linker(&target);
+
+    let error = match std::process::Command::new(&linker)
+        .arg("--version")
+        .output()
+    {
+        Ok(_) => return,
+        Err(error) => error,
+    };
+
+    let export_file = std::env::var("HOME")
+        .map(|home| format!("{home}/export-esp.sh"))
+        .unwrap_or_else(|_| "$HOME/export-esp.sh".to_string());
+
+    panic!(
+        "Xtensa linker `{linker}` was not found in PATH or could not be executed: {error}.\n\n\
+         Xtensa targets on Unix require espup's environment export file to be sourced before building.\n\
+         Try: `source {export_file}`\n\n\
+         If the export file does not exist, run `espup install` first.\n\
+         For more details, see:\n\
+         https://github.com/esp-rs/espup?tab=readme-ov-file#environment-variables-setup"
+    );
+}
+
+#[cfg(not(unix))]
+fn check_xtensa_linker_available() {}
+
+#[cfg(unix)]
+fn xtensa_linker(target: &str) -> String {
+    if let Some(linker) = cargo_configured_linker(target) {
+        return linker;
+    }
+
+    target
+        .strip_prefix("xtensa-")
+        .and_then(|target| target.strip_suffix("-none-elf"))
+        .map(|chip| format!("xtensa-{chip}-elf-gcc"))
+        .unwrap_or_else(|| "xtensa-esp32-elf-gcc".to_string())
+}
+
+#[cfg(unix)]
+fn cargo_configured_linker(target: &str) -> Option<String> {
+    std::env::var(cargo_linker_env_var(target)).ok()
+}
+
+#[cfg(unix)]
+fn cargo_linker_env_var(target: &str) -> String {
+    let target = target.replace('-', "_").to_ascii_uppercase();
+    format!("CARGO_TARGET_{target}_LINKER")
+}
+
+//ENDIF
 fn linker_be_nice() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() > 1 {
