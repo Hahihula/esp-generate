@@ -357,6 +357,7 @@ fn options_for_chip(chip: Chip, all_combinations: bool) -> Result<Vec<Vec<String
                 selected: vec![chip_idx],
                 flat_options: flat_options.clone(),
                 options: template.options.clone(),
+                facts: None,
             };
 
             if let Some(base_template) = base_template {
@@ -411,6 +412,7 @@ fn options_for_chip(chip: Chip, all_combinations: bool) -> Result<Vec<Vec<String
             selected,
             options: template_options.take().unwrap(),
             flat_options: flat_options.take().unwrap(),
+            facts: None,
         };
 
         if is_valid(&config) {

@@ -28,19 +28,19 @@ use embassy_time::{Duration, Timer};
 //+use esp_println as _;
 //ENDIF
 //+use defmt::info;
-//IF !option("panic-handler")
+//IF !group_selected("panic-handler")
 //+use defmt::error;
-//ENDIF !option("panic-handler")
+//ENDIF !group_selected("panic-handler")
 //ELIF option("log")
 use log::info;
-//IF !option("panic-handler")
+//IF !group_selected("panic-handler")
 use log::error;
-//ENDIF !option("panic-handler")
+//ENDIF !group_selected("panic-handler")
 //ELIF option("probe-rs") // without defmt
 //+use rtt_target::rprintln;
 //ENDIF !defmt
 
-//IF !option("panic-handler")
+//IF !group_selected("panic-handler")
 //IF option("defmt") || option("log")
 //+#[panic_handler]
 //+fn panic(panic_info: &core::panic::PanicInfo) -> ! {
@@ -84,9 +84,9 @@ esp_bootloader_esp_idf::esp_app_desc!();
 )]
 #[esp_rtos::main]
 async fn main(spawner: Spawner) -> ! {
-    //REPLACE generate-version generate-version
+    //REPLACE generate-version generate_version
     // generator version: generate-version
-    //REPLACE generate-parameters generate-parameters
+    //REPLACE generate-parameters generate_parameters
     // generator parameters: generate-parameters
 
     //IF option("probe-rs")
@@ -106,7 +106,7 @@ async fn main(spawner: Spawner) -> ! {
     __RESERVED_GPIO_CODE__;
 
     //IF option("alloc")
-    //REPLACE 65536 max-dram2-uninit
+    //REPLACE 65536 dram2_uninit_size
     esp_alloc::heap_allocator!(#[esp_hal::ram(reclaimed)] size: 65536);
     //IF option("wifi") && option("ble-trouble")
     // COEX needs more RAM - so we've added some more
@@ -151,6 +151,6 @@ async fn main(spawner: Spawner) -> ! {
         Timer::after(Duration::from_secs(1)).await;
     }
 
-    //REPLACE {current-version} esp-hal-version-full
+    //REPLACE {current-version} esp_hal_version_full
     // for inspiration have a look at the examples at https://github.com/esp-rs/esp-hal/tree/esp-hal-v{current-version}/examples
 }

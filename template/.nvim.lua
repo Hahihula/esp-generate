@@ -5,7 +5,7 @@ local rust_analyzer = {
         --REPLACE riscv32imac-unknown-none-elf rust_target
         target = "riscv32imac-unknown-none-elf",
         allTargets = false,
-        --IF option("xtensa")
+        --IF is_xtensa
         --REPLACE esp rust_toolchain
         extraEnv = { RUSTUP_TOOLCHAIN = "esp" },
         --ENDIF
@@ -19,7 +19,7 @@ vim.lsp.config("rust-analyzer", {
 -- Note the neovim name of the language server is rust_analyzer with an underscore.
 vim.lsp.config("rust_analyzer", {
 --ENDIF
---IF option("xtensa")
+--IF is_xtensa
 	cmd = { "rustup", "run", "stable", "rust-analyzer" },
 --ENDIF
     settings = {

@@ -12,7 +12,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-#IF option("xtensa")
+#IF is_xtensa
   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 #ENDIF
 
@@ -34,18 +34,18 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v6
       - name: Setup Rust
-#IF option("riscv")
+#IF is_riscv
         uses: dtolnay/rust-toolchain@v1
         with:
 #REPLACE riscv32imac-unknown-none-elf rust_target
           target: riscv32imac-unknown-none-elf
           toolchain: stable
           components: rust-src, rustfmt, clippy
-#ELIF option("xtensa")
+#ELIF is_xtensa
 #+        uses: esp-rs/xtensa-toolchain@v1.5
 #+        with:
 #+          default: true
-#REPLACE esp32 mcu
+#REPLACE esp32 chip
 #+          buildtargets: esp32
 #+          ldproxy: false
 #ENDIF

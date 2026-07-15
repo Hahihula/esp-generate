@@ -12,9 +12,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Add an optional coding-agent guidance template submenu for selecting `AGENTS.md`, `CLAUDE.md`, `CODEX.md`, or `GEMINI.md`. (#335)
 - Generated Xtensa projects now check for the required linker and point Unix users to source espup's export file when it is missing. (#343)
--
+
 ### Changed
 
+- The template contract (option tree, relationship engine, directive processor) now lives in a separate `esp-template-sdk` crate. Generated projects are unchanged. (#352)
+- Template directives evaluate against a single fact API: `is_xtensa`/`is_riscv`/`has_reserved_pins`/`chip_has()` replace the old pseudo-options, and values such as `chip` and `dram2_uninit_size` can now be used in `#IF` conditions. Value names are `snake_case`. (#352)
+- `option()` no longer matches selection-group names — use `group_selected()`. (#352)
 - Chip selector has been moved to the TUI. (#328)
 - The chip needs to be specified as `-o <chip>` instead of `--chip <chip>` when using CLI (#328)
 - Generated projects now keep runtime configuration in `.cargo/esp-config.toml` and include it from `.cargo/config.toml` (#326)
@@ -22,6 +25,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Malformed template directives now report a `file:line` error instead of panicking or being silently ignored.
 - Fixed neovim config (#336)
 
 ### Removed

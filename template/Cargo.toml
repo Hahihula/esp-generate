@@ -1,12 +1,12 @@
 [package]
-#REPLACE project-name project-name
+#REPLACE project-name project_name
 name = "project-name"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.95"
 
 [[bin]]
-#REPLACE project-name project-name
+#REPLACE project-name project_name
 name = "project-name"
 path = "./src/bin/main.rs"
 #IF option("embedded-test")
@@ -22,7 +22,7 @@ test = false
 
 [dependencies]
 esp-hal = { version = "~1.1.0", features = [
-    #REPLACE esp32c6 mcu
+    #REPLACE esp32c6 chip
     "esp32c6",
     #IF option("unstable-hal")
     "unstable",
@@ -46,7 +46,7 @@ esp-rtos = { version = "0.3.0", features = [
     #IF option("embassy")
     "embassy",
     #ENDIF
-    #REPLACE esp32c6 mcu
+    #REPLACE esp32c6 chip
     "esp32c6",
     #IF option("defmt")
     #+"defmt",
@@ -64,7 +64,7 @@ esp-bootloader-esp-idf = { version = "0.5.0", features = [
     #IF option("log")
     "log-04",
     #ENDIF
-    #REPLACE esp32c6 mcu
+    #REPLACE esp32c6 chip
     "esp32c6",
 ] }
 #IF option("defmt")
@@ -73,7 +73,7 @@ esp-bootloader-esp-idf = { version = "0.5.0", features = [
 log = "0.4.27"
 #ENDIF
 
-#IF option("log-frontend") || option("panic-handler") || option("probe-rs")
+#IF group_selected("log-frontend") || group_selected("panic-handler") || option("probe-rs")
 #IF option("probe-rs")
 #IF option("defmt")
 rtt-target = { version = "0.6.2", features = ["defmt"] }
@@ -82,7 +82,7 @@ rtt-target = { version = "0.6.2", features = ["defmt"] }
 #ENDIF defmt
 #ELSE probe-rs
 esp-println = { version = "0.17.0", features = [
-    #REPLACE esp32c6 mcu
+    #REPLACE esp32c6 chip
     "esp32c6",
     #IF option("defmt")
     #+"defmt-espflash",
@@ -95,7 +95,7 @@ esp-println = { version = "0.17.0", features = [
 #ENDIF log-frontend || panic-handler || probe-rs
 #IF option("esp-backtrace")
 esp-backtrace = { version = "0.19.0", features = [
-    #REPLACE esp32c6 mcu
+    #REPLACE esp32c6 chip
     "esp32c6",
     "panic-handler",
     #IF option("defmt")
@@ -167,7 +167,7 @@ smoltcp = { version = "0.13.0", default-features = false, features = [
 ] }
 #ENDIF wifi
 esp-radio = { version = "0.18.0", features = [
-    #REPLACE esp32c6 mcu
+    #REPLACE esp32c6 chip
     "esp32c6",
     #IF option("wifi")
     "wifi",
@@ -220,7 +220,7 @@ critical-section = "1.2.0"
 #IF option("embedded-test")
 [dev-dependencies]
 embedded-test = { version = "0.7.1", features = [
-    #IF option("xtensa")
+    #IF is_xtensa
     "xtensa-semihosting",
     #ENDIF
     #IF option("embassy")

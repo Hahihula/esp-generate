@@ -1,6 +1,7 @@
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
 use esp_generate::Chip;
+use esp_generate::process;
 use esp_generate::template::{GeneratorOption, GeneratorOptionItem, SetValue, Template};
 use esp_generate::{
     append_list_as_sentence,
@@ -509,7 +510,7 @@ fn main() -> Result<()> {
 
     let repository = tui::Repository::new(initial_options, &initial_selected);
 
-    let (mut selected, flat_options) = if !args.headless {
+    let (selected, flat_options) = if !args.headless {
         let mut app = tui::App::new(repository, TEMPLATE.required.clone());
 
         let mut terminal = tui::init_terminal()?;
@@ -643,7 +644,6 @@ fn main() -> Result<()> {
     // Same lookup for TUI and headless: both branches populated the toolchain
     // category in `flat_options` (TUI via scan results, headless via the
     // `--toolchain` CLI hint), so `find_option` resolves in either case.
-    // Needs to be done before selection groups are appended in the loop below.
     let selected_toolchain = selected
         .iter()
         .find(|name| {
@@ -652,42 +652,54 @@ fn main() -> Result<()> {
         })
         .cloned();
 
-    for idx in 0..selected.len() {
-        let (_, option) = find_option(&selected[idx], &flat_options).unwrap();
-        selected.push(option.selection_group.clone());
+    // The selection groups that have a pick, backing `group_selected(...)`.
+    // Kept as a separate list rather than appended to `selected`: option and
+    // group names live in disjoint namespaces, so `option("<group>")` must not
+    // answer true (the bundled template has `coding-agent-guidance` as both a
+    // category and a group).
+    let mut selected_groups: Vec<String> = Vec::new();
+    for name in &selected {
+        let (_, option) = find_option(name, &flat_options).unwrap();
+        if !option.selection_group.is_empty() && !selected_groups.contains(&option.selection_group)
+        {
+            selected_groups.push(option.selection_group.clone());
+        }
     }
 
-    let mut variables = vec![
-        // Generator specific
-        ("generate-version", env!("CARGO_PKG_VERSION").to_string()),
-        // Project specific
-        ("project-name", name.clone()),
-        ("generate-parameters", selected_options),
-        // Template specific
-        ("esp-hal-version-full", esp_hal_version_full),
-    ];
+    // `set_value` keeps the first writer, so binary facts below take precedence
+    // over template-scoped `sets` merged later — a template can't shadow `chip`,
+    // `project_name`, etc.
+    let mut facts = process::Facts::default();
+    facts.set_value("generate_version", env!("CARGO_PKG_VERSION"));
+    facts.set_value("project_name", name.clone());
+    facts.set_value("generate_parameters", selected_options);
+    facts.set_value("esp_hal_version_full", esp_hal_version_full);
 
-    // Inject chip-specific variables when possible.
+    // Chip-specific facts back `chip_has(...)` and `is_xtensa`/`is_riscv`.
     if let Some(chip) = selected.iter().find(|name| {
         find_option(name, &flat_options).is_some_and(|(_, opt)| opt.selection_group == "chip")
     }) {
         let chip: Chip = chip
             .parse()
             .unwrap_or_else(|_| panic!("Not a valid chip name"));
-        variables.extend_from_slice(&[
-            ("mcu", chip.to_string()),
-            ("max-dram2-uninit", chip.dram2_region().size().to_string()),
-            ("rust_target", chip.metadata().target().to_string()),
-        ]);
+        facts.set_value("chip", chip.to_string());
+        // Int-typed so `#IF dram2_uninit_size > 0` works; `#REPLACE` still
+        // splices the decimal form.
+        facts.set_value("dram2_uninit_size", chip.dram2_region().size());
+        facts.set_value("rust_target", chip.metadata().target());
 
-        selected.push(if chip.metadata().is_xtensa() {
-            "xtensa".to_string()
-        } else {
-            "riscv".to_string()
-        });
+        facts.symbols = chip
+            .metadata()
+            .all_symbols()
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+
+        facts.is_xtensa = chip.metadata().is_xtensa();
+        facts.is_riscv = !facts.is_xtensa;
 
         if let Some(tc) = selected_toolchain.as_ref() {
-            variables.push(("rust_toolchain", tc.clone()));
+            facts.set_value("rust_toolchain", tc.clone());
         }
 
         let mut reserved_gpio_code = String::new();
@@ -729,9 +741,9 @@ fn main() -> Result<()> {
                 .unwrap();
             }
 
-            // Only set module-selected if there are GPIOs to reserve
+            // Backs the `has_reserved_pins` fact.
             if restricted_pins.clone().next().is_some() {
-                selected.push("module-selected".to_string());
+                facts.has_reserved_pins = true;
 
                 let pin_plucker = restricted_pins
                     .map(|pin| format!("    let _ = peripherals.GPIO{};", pin.pin))
@@ -745,7 +757,7 @@ fn main() -> Result<()> {
             .unwrap();
             };
         }
-        variables.push(("reserved_gpio_code", reserved_gpio_code));
+        facts.set_value("reserved_gpio_code", reserved_gpio_code);
 
         // Check versions and install tools only when a chip is known, and
         // BEFORE we generate the project.
@@ -754,29 +766,22 @@ fn main() -> Result<()> {
             selected.contains(&"probe-rs".to_string()),
             msrv,
             selected.contains(&"stack-smashing-protection".to_string())
-                && selected.contains(&"riscv".to_string()),
+                && !chip.metadata().is_xtensa(),
             args.headless,
             selected_toolchain.as_deref(),
         );
     }
 
-    // Merge scalar `sets` entries contributed by the selected options (e.g.
-    // the chip-group option contributes `wokwi-board`). Generator-provided
-    // variables above take precedence — `#REPLACE` lookup is first-match-wins
-    // — so a template author can't accidentally shadow `project-name` /
-    // `mcu` / etc. by declaring them in an option's `sets`.
-    //
-    // List-valued entries (e.g. `remove_pins`) aren't substitutable text and
-    // are consumed directly by the code-generation paths that know what to
-    // do with them (see the pin-reservation block below), so they're
-    // deliberately skipped here instead of being joined into a string.
+    // Merge scalar `sets` from selected options (e.g. `wokwi-board`).
+    // List-valued entries are consumed directly by code-generation paths
+    // (see the pin-reservation block above) and are skipped here.
     for name in &selected {
         let Some((_, opt)) = find_option(name, &flat_options) else {
             continue;
         };
         for (key, value) in &opt.sets {
             if let Some(scalar) = value.as_scalar() {
-                variables.push((key, scalar.to_string()));
+                facts.set_value(key.clone(), scalar);
             }
         }
     }
@@ -791,14 +796,24 @@ fn main() -> Result<()> {
 
     fs::create_dir(&project_dir)?;
 
-    for &(file_path, contents) in TEMPLATE_FILES.iter() {
-        let mut file_path = file_path.to_string();
-        if let Some(processed) = process_file(contents, &selected, &variables, &mut file_path) {
-            let file_path = project_dir.join(file_path);
+    for &(source_path, contents) in TEMPLATE_FILES.iter() {
+        let mut out_path = source_path.to_string();
+        let processed =
+            process::process_file(contents, &selected, &selected_groups, &facts, &mut out_path)
+                .map_err(|e| anyhow::anyhow!("{source_path}:{e}"))?;
+        let Some(processed) = processed else {
+            continue; // excluded by #INCLUDEFILE
+        };
 
-            fs::create_dir_all(file_path.parent().unwrap())?;
-            fs::write(file_path, processed)?;
+        // Reject any output path that escapes the project dir, even after
+        // the SDK already validates `#INCLUDE_AS` paths.
+        if !process::is_safe_relative_path(&out_path) {
+            bail!("template file `{source_path}` resolved to unsafe output path `{out_path}`");
         }
+        let out_path = project_dir.join(out_path);
+
+        fs::create_dir_all(out_path.parent().unwrap())?;
+        fs::write(out_path, processed)?;
     }
 
     // Run cargo fmt:
@@ -891,215 +906,6 @@ fn build_options(
     options
 }
 
-#[derive(Clone, Copy)]
-enum BlockKind {
-    // All lines are included
-    Root,
-
-    // (current branch to be included, any previous branches included)
-    IfElse(bool, bool),
-}
-
-impl BlockKind {
-    fn include_line(self) -> bool {
-        match self {
-            BlockKind::Root => true,
-            BlockKind::IfElse(current, any) => current && !any,
-        }
-    }
-
-    fn new_if(current: bool) -> BlockKind {
-        BlockKind::IfElse(current, false)
-    }
-
-    fn into_else_if(self, condition: bool) -> BlockKind {
-        let BlockKind::IfElse(previous, any) = self else {
-            panic!("ELIF without IF");
-        };
-        BlockKind::IfElse(condition, any || previous)
-    }
-
-    fn into_else(self) -> BlockKind {
-        let BlockKind::IfElse(previous, any) = self else {
-            panic!("ELSE without IF");
-        };
-        BlockKind::IfElse(!any, any || previous)
-    }
-}
-
-fn process_file(
-    contents: &str,               // Raw content of the file
-    options: &[String],           // Selected options
-    variables: &[(&str, String)], // Variables and their values in tuples
-    file_path: &mut String,       // File path to be modified
-) -> Option<String> {
-    let mut res = String::new();
-
-    let mut replace: Option<Vec<(&str, &str)>> = None;
-    let mut include = vec![BlockKind::Root];
-    let mut file_directives = true;
-
-    // Create a new Rhai engine and scope
-    let mut engine = somni_expr::Context::new();
-
-    // Define a custom function to check if conditions of the options.
-    engine.add_function("option", move |cond: &str| -> bool {
-        options.iter().any(|c| c == cond)
-    });
-
-    let mut include_file = true;
-
-    for (line_no, line) in contents.lines().enumerate() {
-        let line_no = line_no + 1;
-        let trimmed: &str = line.trim();
-
-        // We check for the first line to see if we should include the file
-        if file_directives {
-            // Determine if the line starts with a known include directive
-            if let Some(cond) = trimmed
-                .strip_prefix("//INCLUDEFILE ")
-                .or_else(|| trimmed.strip_prefix("#INCLUDEFILE "))
-                .or_else(|| trimmed.strip_prefix("--INCLUDEFILE "))
-            {
-                include_file = engine.evaluate::<bool>(cond).unwrap();
-                continue;
-            } else if let Some(include_as) = trimmed
-                .strip_prefix("//INCLUDE_AS ")
-                .or_else(|| trimmed.strip_prefix("#INCLUDE_AS "))
-                .or_else(|| trimmed.strip_prefix("--INCLUDE_AS "))
-            {
-                let mut include_as = include_as.trim().to_string();
-                for (key, value) in variables {
-                    include_as = include_as.replace(&format!("{{{key}}}"), value);
-                }
-                *file_path = include_as;
-                continue;
-            }
-        }
-        if !include_file {
-            return None;
-        }
-
-        file_directives = false;
-
-        // that's a bad workaround
-        if trimmed == "#[rustfmt::skip]" {
-            log::info!("Skipping rustfmt");
-            continue;
-        }
-
-        // Check if we should replace the next line with the key/value of a variable
-        if let Some(what) = trimmed
-            .strip_prefix("#REPLACE ")
-            .or_else(|| trimmed.strip_prefix("//REPLACE "))
-            .or_else(|| trimmed.strip_prefix("--REPLACE "))
-        {
-            let replacements = what
-                .split(" && ")
-                .filter_map(|pair| {
-                    let mut parts = pair.split_whitespace();
-                    if let (Some(pattern), Some(var_name)) = (parts.next(), parts.next()) {
-                        if let Some((_, value)) = variables.iter().find(|(key, _)| key == &var_name)
-                        {
-                            Some((pattern, value.as_str()))
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    }
-                })
-                .collect::<Vec<_>>();
-
-            if !replacements.is_empty() {
-                replace = Some(replacements);
-            }
-        // Check if we should include the next line(s)
-        } else if trimmed.starts_with("#IF ")
-            || trimmed.starts_with("//IF ")
-            || trimmed.starts_with("--IF ")
-        {
-            let cond = trimmed
-                .strip_prefix("#IF ")
-                .or_else(|| trimmed.strip_prefix("//IF "))
-                .or_else(|| trimmed.strip_prefix("--IF "))
-                .unwrap();
-            let last = *include.last().unwrap();
-
-            // Only evaluate condition if this IF is in a branch that should be included
-            let current = if last.include_line() {
-                engine.evaluate::<bool>(cond).unwrap()
-            } else {
-                false
-            };
-
-            include.push(BlockKind::new_if(current));
-        } else if trimmed.starts_with("#ELIF ")
-            || trimmed.starts_with("//ELIF ")
-            || trimmed.starts_with("--ELIF ")
-        {
-            let cond = trimmed
-                .strip_prefix("#ELIF ")
-                .or_else(|| trimmed.strip_prefix("//ELIF "))
-                .or_else(|| trimmed.strip_prefix("--ELIF "))
-                .unwrap();
-            let last = include.pop().unwrap();
-
-            // Only evaluate condition if no other branches evaluated to true
-            let current = if matches!(last, BlockKind::IfElse(false, false)) {
-                engine.evaluate::<bool>(cond).unwrap()
-            } else {
-                false
-            };
-
-            include.push(last.into_else_if(current));
-        } else if trimmed.starts_with("#ELSE")
-            || trimmed.starts_with("//ELSE")
-            || trimmed.starts_with("--ELSE")
-        {
-            let last = include.pop().unwrap();
-            include.push(last.into_else());
-        } else if trimmed.starts_with("#ENDIF")
-            || trimmed.starts_with("//ENDIF")
-            || trimmed.starts_with("--ENDIF")
-        {
-            let prev = include.pop();
-            assert!(
-                matches!(prev, Some(BlockKind::IfElse(_, _))),
-                "ENDIF without IF in {file_path}:{line_no}"
-            );
-        // Trim #+ and //+
-        } else if include.iter().all(|v| v.include_line()) {
-            let mut line = line.to_string();
-
-            if trimmed.starts_with("#+") {
-                line = line.replace("#+", "");
-            }
-
-            if trimmed.starts_with("//+") {
-                line = line.replace("//+", "");
-            }
-
-            if trimmed.starts_with("--+") {
-                line = line.replace("--+", "");
-            }
-
-            if let Some(replacements) = &replace {
-                for (pattern, value) in replacements {
-                    line = line.replace(pattern, value);
-                }
-            }
-
-            res.push_str(&line);
-            res.push('\n');
-
-            replace = None;
-        }
-    }
-
-    Some(res)
-}
-
 fn process_options(template: &Template, args: &Args) -> Result<()> {
     let mut success = true;
     // Two option catalogues, with complementary coverage:
@@ -1123,6 +929,7 @@ fn process_options(template: &Template, args: &Args) -> Result<()> {
         selected,
         flat_options,
         options: template.options.clone(),
+        facts: None,
     };
 
     let mut same_selection_group: HashMap<&str, Vec<&str>> = HashMap::new();
@@ -1239,195 +1046,4 @@ fn should_initialize_git_repo(mut path: &Path) -> bool {
     }
 
     true
-}
-
-#[cfg(test)]
-mod test {
-    use super::*;
-
-    #[test]
-    fn test_nested_if_else1() {
-        let res = process_file(
-            r#"
-        #IF option("opt1")
-        opt1
-        #IF option("opt2")
-        opt2
-        #ELSE
-        !opt2
-        #ENDIF
-        #ELSE
-        !opt1
-        #ENDIF
-        "#,
-            &["opt1".to_string(), "opt2".to_string()],
-            &[],
-            &mut String::from("main.rs"),
-        )
-        .unwrap();
-
-        assert_eq!(
-            r#"
-        opt1
-        opt2
-        "#
-            .trim(),
-            res.trim()
-        );
-    }
-
-    #[test]
-    fn test_nested_if_else2() {
-        let res = process_file(
-            r#"
-        #IF option("opt1")
-        opt1
-        #IF option("opt2")
-        opt2
-        #ELSE
-        !opt2
-        #ENDIF
-        #ELSE
-        !opt1
-        #ENDIF
-        "#,
-            &[],
-            &[],
-            &mut String::from("main.rs"),
-        )
-        .unwrap();
-
-        assert_eq!(
-            r#"
-        !opt1
-        "#
-            .trim(),
-            res.trim()
-        );
-    }
-
-    #[test]
-    fn test_nested_if_else3() {
-        let res = process_file(
-            r#"
-        #IF option("opt1")
-        opt1
-        #IF option("opt2")
-        opt2
-        #ELSE
-        !opt2
-        #ENDIF
-        #ELSE
-        !opt1
-        #ENDIF
-        "#,
-            &["opt1".to_string()],
-            &[],
-            &mut String::from("main.rs"),
-        )
-        .unwrap();
-
-        assert_eq!(
-            r#"
-        opt1
-        !opt2
-        "#
-            .trim(),
-            res.trim()
-        );
-    }
-
-    #[test]
-    fn test_nested_if_else4() {
-        let res = process_file(
-            r#"
-        #IF option("opt1")
-        #IF option("opt2")
-        opt2
-        #ELSE
-        !opt2
-        #ENDIF
-        opt1
-        #ENDIF
-        "#,
-            &["opt1".to_string()],
-            &[],
-            &mut String::from("main.rs"),
-        )
-        .unwrap();
-
-        assert_eq!(
-            r#"
-        !opt2
-        opt1
-        "#
-            .trim(),
-            res.trim()
-        );
-    }
-
-    #[test]
-    fn test_nested_if_else5() {
-        let res = process_file(
-            r#"
-        #IF option("opt1")
-        #IF option("opt2")
-        opt2
-        #ELSE
-        !opt2
-        #ENDIF
-        opt1
-        #ENDIF
-        "#,
-            &["opt2".to_string()],
-            &[],
-            &mut String::from("main.rs"),
-        )
-        .unwrap();
-
-        assert_eq!(
-            r#"
-        "#
-            .trim(),
-            res.trim()
-        );
-    }
-
-    #[test]
-    fn test_basic_elseif() {
-        let template = r#"
-        #IF option("opt1")
-        opt1
-        #ELIF option("opt2")
-        opt2
-        #ELIF option("opt3")
-        opt3
-        #ELSE
-        opt4
-        #ENDIF
-        "#;
-
-        const PAIRS: &[(&[&str], &str)] = &[
-            (&["opt1"], "opt1"),
-            (&["opt1", "opt2"], "opt1"),
-            (&["opt1", "opt3"], "opt1"),
-            (&["opt1", "opt2", "opt3"], "opt1"),
-            (&["opt2"], "opt2"),
-            (&["opt2", "opt3"], "opt2"),
-            (&["opt3"], "opt3"),
-            (&["opt4"], "opt4"),
-            (&[], "opt4"),
-        ];
-
-        for (options, expected) in PAIRS.iter().cloned() {
-            let res = process_file(
-                template,
-                &options.iter().map(|o| o.to_string()).collect::<Vec<_>>(),
-                &[],
-                &mut String::from("main.rs"),
-            )
-            .unwrap();
-            assert_eq!(expected, res.trim(), "options: {:?}", options);
-        }
-    }
 }

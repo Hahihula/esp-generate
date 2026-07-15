@@ -1,9 +1,5 @@
 use core::str;
-use std::{
-    fmt::Display,
-    path::{Path, PathBuf},
-    str::FromStr,
-};
+use std::path::{Path, PathBuf};
 
 use ratatui::crossterm::{
     event::{self, Event, KeyCode},
@@ -12,46 +8,9 @@ use ratatui::crossterm::{
 
 use esp_metadata_generated::Chip;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Version {
-    major: u8,
-    minor: u8,
-    patch: u8,
-}
-
-impl Version {
-    pub fn is_at_least(&self, other: &Version) -> bool {
-        (self.major, self.minor, self.patch) >= (other.major, other.minor, other.patch)
-    }
-}
-
-impl Display for Version {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}.{}.{}", self.major, self.minor, self.patch)
-    }
-}
-
-impl FromStr for Version {
-    type Err = &'static str;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let mut parts = s.split(&['.', '-', '+']);
-        let major = parts
-            .next()
-            .and_then(|s| s.parse::<u8>().ok())
-            .ok_or("Invalid major version")?;
-        let minor = parts
-            .next()
-            .and_then(|s| s.parse::<u8>().ok())
-            .ok_or("Invalid minor version")?;
-        let patch = parts.next().and_then(|s| s.parse::<u8>().ok()).unwrap_or(0);
-        Ok(Version {
-            major,
-            minor,
-            patch,
-        })
-    }
-}
+/// Tool/toolchain versions use the SDK's contract `Version` — one version type
+/// for the whole workspace.
+pub use esp_template_sdk::contract::Version;
 
 #[derive(Debug, PartialEq, Eq)]
 enum CheckResult {
@@ -102,7 +61,7 @@ pub fn check(
         &[format!("+{rust_toolchain}").as_str()],
         headless,
         Some(rust_install_cmd),
-        Some((msrv.major, msrv.minor, msrv.patch)),
+        Some(msrv),
     );
 
     let espflash_version = if !probe_rs_required {
@@ -111,7 +70,7 @@ pub fn check(
             &[],
             headless,
             Some(&["cargo", "install", "espflash", "--locked"]),
-            Some((3, 3, 0)),
+            Some(Version::new(3, 3, 0)),
         )
     } else {
         get_version("espflash", &[])
@@ -123,7 +82,7 @@ pub fn check(
             &[],
             headless,
             Some(&["cargo", "install", "probe-rs-tools", "--locked"]),
-            Some((0, 31, 0)),
+            Some(Version::new(0, 31, 0)),
         )
     } else {
         get_version("probe-rs", &[])
@@ -140,7 +99,7 @@ pub fn check(
             "--features=tui",
             "--locked",
         ]),
-        Some((0, 5, 0)),
+        Some(Version::new(0, 5, 0)),
     );
 
     let probers_suggestion_kind = if probe_rs_required {
@@ -185,7 +144,7 @@ fn create_check_results(
     requirements_unsatisfied |= format_result(
         false,
         &format!("Rust ({rust_toolchain})"),
-        check_version(rust_version, msrv.major, msrv.minor, msrv.patch),
+        check_version(rust_version, msrv),
         format!(
             "minimum required version is {msrv} - run `{rust_toolchain_tool} update` to upgrade"
         ),
@@ -196,7 +155,7 @@ fn create_check_results(
     requirements_unsatisfied |= format_result(
         false,
         "espflash",
-        check_version(espflash_version, 3, 3, 0),
+        check_version(espflash_version, Version::new(3, 3, 0)),
         "minimum required version is 3.3.0 - see https://crates.io/crates/espflash",
         "not found - see https://crates.io/crates/espflash for installation instructions",
         true,
@@ -205,7 +164,7 @@ fn create_check_results(
     requirements_unsatisfied |= format_result(
         !probe_rs_required,
         "probe-rs",
-        check_version(probers_version, 0, 31, 0),
+        check_version(probers_version, Version::new(0, 31, 0)),
         format!(
             "minimum {probers_suggestion_kind} version is 0.31.0 - see https://probe.rs/docs/getting-started/installation/ for how to upgrade"
         ),
@@ -218,7 +177,7 @@ fn create_check_results(
     requirements_unsatisfied |= format_result(
         true,
         "esp-config",
-        check_version(esp_config_version, 0, 5, 0),
+        check_version(esp_config_version, Version::new(0, 5, 0)),
         "minimum suggested version is 0.5.0",
         "not found - use `cargo install esp-config --features=tui --locked` to install (installation is optional)",
         probe_rs_required,
@@ -274,9 +233,9 @@ fn format_result(
     }
 }
 
-fn check_version(version: Option<Version>, major: u8, minor: u8, patch: u8) -> CheckResult {
+fn check_version(version: Option<Version>, required: Version) -> CheckResult {
     match version {
-        Some(v) if (v.major, v.minor, v.patch) < (major, minor, patch) => CheckResult::WrongVersion,
+        Some(v) if v < required => CheckResult::WrongVersion,
         Some(v) => CheckResult::Ok(v),
         None => CheckResult::NotFound,
     }
@@ -321,15 +280,7 @@ fn try_extract_version(cmd: &str, line: &str) -> Option<Version> {
 
     let version = parts.next()?;
 
-    let mut version = version.split(&['.', '-', '+']);
-    let major = version.next()?.parse::<u8>().ok()?;
-    let minor = version.next()?.parse::<u8>().ok()?;
-    let patch = version.next()?.parse::<u8>().ok()?;
-    Some(Version {
-        major,
-        minor,
-        patch,
-    })
+    version.parse().ok()
 }
 
 pub fn offensive_cargo_config_check(path: &Path) -> bool {
@@ -365,7 +316,7 @@ fn get_version_or_install(
     args: &[&str],
     headless: bool,
     install_cmd: Option<&[&str]>,
-    min_version: Option<(u8, u8, u8)>,
+    min_version: Option<Version>,
 ) -> Option<Version> {
     let version = get_version(cmd, args);
 
@@ -374,18 +325,16 @@ fn get_version_or_install(
     }
 
     match min_version {
-        Some((min_major, min_minor, min_patch)) => {
-            match check_version(version.clone(), min_major, min_minor, min_patch) {
-                CheckResult::Ok(_) => return version, // nothing to do - tool exists and version is above minimal allowed
-                CheckResult::WrongVersion | CheckResult::NotFound => {
-                    let Some(install_cmd) = install_cmd else {
-                        // no way to offer an automatic install/upgrade
-                        return version;
-                    };
-                    prompt_install(cmd, install_cmd);
-                }
+        Some(min) => match check_version(version, min) {
+            CheckResult::Ok(_) => return version, // nothing to do - tool exists and version is above minimal allowed
+            CheckResult::WrongVersion | CheckResult::NotFound => {
+                let Some(install_cmd) = install_cmd else {
+                    // no way to offer an automatic install/upgrade
+                    return version;
+                };
+                prompt_install(cmd, install_cmd);
             }
-        }
+        },
         None => {
             if version.is_some() {
                 // we don't know minimum version and the tool exists – nothing to do
@@ -488,7 +437,7 @@ mod tests {
             patch: 0,
         });
         assert_eq!(
-            check_version(version, 1, 84, 0),
+            check_version(version, Version::new(1, 84, 0)),
             CheckResult::Ok(Version {
                 major: 1,
                 minor: 84,
@@ -501,23 +450,35 @@ mod tests {
             minor: 85,
             patch: 0,
         });
-        assert_eq!(check_version(version, 1, 84, 0), CheckResult::WrongVersion);
+        assert_eq!(
+            check_version(version, Version::new(1, 84, 0)),
+            CheckResult::WrongVersion
+        );
         // Wrong minor
         let version = Some(Version {
             major: 1,
             minor: 83,
             patch: 0,
         });
-        assert_eq!(check_version(version, 1, 84, 0), CheckResult::WrongVersion);
+        assert_eq!(
+            check_version(version, Version::new(1, 84, 0)),
+            CheckResult::WrongVersion
+        );
         // Wrong patch
         let version = Some(Version {
             major: 1,
             minor: 84,
             patch: 0,
         });
-        assert_eq!(check_version(version, 1, 84, 1), CheckResult::WrongVersion);
+        assert_eq!(
+            check_version(version, Version::new(1, 84, 1)),
+            CheckResult::WrongVersion
+        );
         // Not found
-        assert_eq!(check_version(None, 1, 84, 0), CheckResult::NotFound);
+        assert_eq!(
+            check_version(None, Version::new(1, 84, 0)),
+            CheckResult::NotFound
+        );
     }
 
     #[test]

@@ -52,6 +52,7 @@ impl Repository {
                     .collect(),
                 flat_options,
                 options,
+                facts: None,
             },
             path: Vec::new(),
         }
@@ -374,6 +375,14 @@ impl Repository {
 }
 
 pub fn init_terminal() -> Result<Terminal<CrosstermBackend<io::Stdout>>> {
+    // Restore the terminal on panic so a panic from the IO-free SDK
+    // doesn't leave the terminal in raw/alternate-screen mode.
+    let previous_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        ratatui::restore();
+        previous_hook(info);
+    }));
+
     enable_raw_mode()?;
     io::stdout().execute(EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(io::stdout());
@@ -641,6 +650,7 @@ mod test {
             requires: requires.iter().map(|r| r.to_string()).collect(),
             compatible: IndexMap::new(),
             sets: IndexMap::new(),
+            ..Default::default()
         })
     }
 
@@ -662,6 +672,7 @@ mod test {
             requires: requires.iter().map(|r| r.to_string()).collect(),
             compatible,
             sets: IndexMap::new(),
+            ..Default::default()
         })
     }
 
@@ -676,6 +687,7 @@ mod test {
             requires: Vec::new(),
             compatible: IndexMap::new(),
             sets: IndexMap::new(),
+            ..Default::default()
         })
     }
 
@@ -899,6 +911,7 @@ mod test {
                 requires: vec!["!method".to_string()],
                 compatible: wrong_chip_compat,
                 sets: IndexMap::new(),
+                ..Default::default()
             }),
         ];
         let repository = Repository::new(

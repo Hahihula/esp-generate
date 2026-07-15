@@ -2,7 +2,7 @@
 [wokwi]
 version = 1
 gdbServerPort = 3333
-#REPLACE project-name project-name && rust_target rust_target
+#REPLACE project-name project_name && rust_target rust_target
 elf = "target/rust_target/debug/project-name"
-#REPLACE project-name project-name && rust_target rust_target
+#REPLACE project-name project_name && rust_target rust_target
 firmware = "target/rust_target/debug/project-name"

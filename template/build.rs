@@ -1,6 +1,6 @@
 fn main() {
     linker_be_nice();
-    //IF option("xtensa")
+    //IF is_xtensa
     check_xtensa_linker_available();
     //ENDIF
     //IF option("embedded-test")
@@ -13,7 +13,7 @@ fn main() {
     println!("cargo:rustc-link-arg=-Tlinkall.x");
 }
 
-//IF option("xtensa")
+//IF is_xtensa
 #[cfg(unix)]
 fn check_xtensa_linker_available() {
     println!("cargo:rerun-if-env-changed=PATH");
@@ -135,12 +135,12 @@ fn linker_be_nice() {
         std::process::exit(0);
     }
 
-    //IF option("xtensa")
+    //IF is_xtensa
     println!(
         "cargo:rustc-link-arg=-Wl,--error-handling-script={}",
         std::env::current_exe().unwrap().display()
     );
-    //ELIF option("riscv")
+    //ELIF is_riscv
     println!(
         "cargo:rustc-link-arg=--error-handling-script={}",
         std::env::current_exe().unwrap().display()

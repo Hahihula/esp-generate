@@ -7,14 +7,14 @@
                     "allTargets": false,
                     //REPLACE riscv32imac-unknown-none-elf rust_target
                     "target": "riscv32imac-unknown-none-elf",
-                    //IF option("xtensa")
+                    //IF is_xtensa
                     "extraEnv": {
                         //REPLACE esp rust_toolchain
                         "RUSTUP_TOOLCHAIN": "esp"
                     }
                     //ENDIF
                 },
-                //IF option("xtensa")
+                //IF is_xtensa
                 "server": {
                     "extraEnv": {
                         "RUSTUP_TOOLCHAIN": "stable"

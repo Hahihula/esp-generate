@@ -86,24 +86,30 @@ pub struct GeneratorOption {
     /// [`CompatibilityRequirements`].
     #[serde(default)]
     pub compatible: CompatibilityRequirements,
-    /// Option-scoped template data. Each selected option's `sets` entries
-    /// are merged into the generation context, keyed by variable name. Values
-    /// can be scalars or lists ([`SetValue`]) so the same mechanism carries
-    /// heterogeneous data:
+    /// Option-scoped template data, merged into the generation context per
+    /// selected option. Scalars feed `#REPLACE` substitutions; lists feed
+    /// code-generation paths (e.g. the module pin-reservation block, which
+    /// intersects `remove_pins` with the chip's pin metadata).
     ///
-    ///   * scalars (`wokwi-board: board-...`) feed `#REPLACE` substitutions
-    ///     in template files — chips that have no Wokwi model simply don't
-    ///     contribute a `wokwi-board` entry;
-    ///   * lists (`remove_pins: [spi_flash, spi_psram]`) feed code-generation
-    ///     paths — the module pin-reservation block intersects `remove_pins`
-    ///     with the chip's pin metadata to emit `let _ = peripherals.GPIOn;`
-    ///     stanzas.
-    ///
-    /// Keys must not collide with the fixed set of generator-provided
-    /// variables (`project-name`, `mcu`, `rust_target`, etc.); on collision
-    /// the generator-provided value wins to preserve existing behaviour.
+    /// Keys must not collide with generator-provided facts; on collision the
+    /// generator-provided value wins.
     #[serde(default)]
     pub sets: IndexMap<String, SetValue>,
+    /// Metadata symbols the selected chip must declare for this option to be
+    /// compatible (AND). Evaluated against [`crate::process::Facts::symbols`];
+    /// empty = no gate.
+    #[serde(default)]
+    pub requires_capabilities: Vec<String>,
+    /// Host tools the binary should pre-flight when this option is selected
+    /// (e.g. `[probe-rs]`). The option only declares the need; the binary owns
+    /// the check. An open list: an unknown tool gets a generic PATH-presence
+    /// check, never a hard error.
+    #[serde(default)]
+    pub requires_tools: Vec<String>,
+    /// When set, the binary offers only nightly toolchains while this option is
+    /// selected. The binary reads it off the selected options.
+    #[serde(default)]
+    pub requires_nightly: bool,
 }
 
 impl GeneratorOption {

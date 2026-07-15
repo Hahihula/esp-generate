@@ -2,8 +2,9 @@ use esp_metadata_generated::{MemoryRegion, PinInfo};
 use serde::{Deserialize, Serialize};
 
 pub mod cargo;
-pub mod config;
-pub mod template;
+
+pub use esp_template_sdk::{config, process, template};
+
 /// Build-script-generated `TEMPLATE_FILES` array mapping each file under
 /// `template/` to its baked-in contents. Kept `pub` so xtask (and any other
 /// consumer that needs to resolve `!Include` paths against the bundled
