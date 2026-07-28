@@ -63,6 +63,28 @@ impl Chip {
     pub fn pins(self) -> &'static [PinInfo] {
         self.metadata().pins()
     }
+
+    /// The chip-derived half of [`process::Facts`]: everything that depends on
+    /// which chip is selected and on nothing else.
+    pub fn facts(self) -> process::Facts {
+        let metadata = self.metadata();
+        let mut facts = process::Facts {
+            symbols: metadata
+                .all_symbols()
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            is_xtensa: metadata.is_xtensa(),
+            is_riscv: !metadata.is_xtensa(),
+            ..Default::default()
+        };
+        facts.set_value("chip", self.to_string());
+        // Int-typed so `#IF dram2_uninit_size > 0` works; `#REPLACE` still
+        // splices the decimal form.
+        facts.set_value("dram2_uninit_size", self.dram2_region().size());
+        facts.set_value("rust_target", metadata.target());
+        facts
+    }
 }
 
 /// This turns a list of strings into a sentence, and appends it to the base string.
@@ -109,5 +131,51 @@ pub fn append_list_as_sentence<S: AsRef<str>>(base: &str, word: &str, els: &[S])
         requires
     } else {
         base.to_string()
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use strum::IntoEnumIterator;
+
+    use super::*;
+
+    /// [`Chip::facts`] is what makes `requires_capabilities` enforceable: the
+    /// SDK's capability gate is only as good as the symbol set handed to it,
+    /// and an empty or chip-independent set would silently pass everything.
+    #[test]
+    fn chip_facts_carry_a_chip_specific_symbol_set() {
+        let c6 = Chip::Esp32c6.facts();
+        let h2 = Chip::Esp32h2.facts();
+
+        assert!(c6.symbols.contains("soc_has_wifi"));
+        assert!(
+            !h2.symbols.contains("soc_has_wifi"),
+            "ESP32-H2 has no Wi-Fi; a gate on `soc_has_wifi` must be able to tell it apart from a C6"
+        );
+    }
+
+    /// The ISA flags and substitution values travel with the symbols, so no
+    /// caller can install half the chip's facts and leave `is_xtensa` stale
+    /// from a previously selected chip.
+    #[test]
+    fn chip_facts_are_complete_for_every_chip() {
+        for chip in Chip::iter() {
+            let facts = chip.facts();
+
+            assert!(!facts.symbols.is_empty(), "{chip} declares no symbols");
+            assert_ne!(
+                facts.is_xtensa, facts.is_riscv,
+                "{chip} must be exactly one of Xtensa or RISC-V"
+            );
+            assert_eq!(
+                facts.values.get("chip"),
+                Some(&process::FactValue::Str(chip.to_string())),
+                "{chip} must name itself"
+            );
+            for key in ["dram2_uninit_size", "rust_target"] {
+                assert!(facts.values.contains_key(key), "{chip} is missing `{key}`");
+            }
+        }
     }
 }

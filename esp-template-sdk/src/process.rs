@@ -95,6 +95,17 @@ impl From<usize> for FactValue {
     }
 }
 
+/// The set of *valid names* each string-argument predicate accepts.
+#[derive(Debug, Default, Clone)]
+pub struct Vocabulary {
+    /// Every capability name declared by any supported chip. Backs `chip_has`.
+    pub symbols: HashSet<String>,
+    /// Every option name the template declares. Backs `option`.
+    pub options: HashSet<String>,
+    /// Every selection-group name the template declares. Backs `group_selected`.
+    pub groups: HashSet<String>,
+}
+
 /// Chip-derived facts passed from the binary to the SDK — the single conduit
 /// for everything the directive engine needs to know about the target that
 /// isn't a user selection.
@@ -102,6 +113,8 @@ impl From<usize> for FactValue {
 pub struct Facts {
     /// Metadata symbols the chip declares. Backs `chip_has(symbol)`.
     pub symbols: HashSet<String>,
+    /// Known-name vocabularies backing the unknown-name hard error.
+    pub vocabulary: Vocabulary,
     /// Substitution values: spliced literally by `#REPLACE` / `#INCLUDE_AS`,
     /// and exposed to `#IF` as somni variables when the name is an identifier.
     pub values: HashMap<String, FactValue>,
@@ -171,6 +184,25 @@ impl BlockKind {
     }
 }
 
+/// Out-of-band slot for the first unknown name seen while evaluating one
+/// condition.
+///
+/// somni predicates return a plain `bool` with no error channel, so a
+/// vocabulary miss can't be reported from inside the closure. It is recorded
+/// here instead and promoted to a [`ProcessError`] by [`eval_bool`] once
+/// evaluation returns. Only the first is kept: short-circuiting means later
+/// names in the same condition may not even have been reached, so reporting
+/// them all would be misleading.
+type UnknownName = std::cell::RefCell<Option<String>>;
+
+/// Record an unknown-name failure, keeping the first.
+fn note_unknown(slot: &UnknownName, reason: String) {
+    let mut slot = slot.borrow_mut();
+    if slot.is_none() {
+        *slot = Some(reason);
+    }
+}
+
 /// Build the somni evaluation context exposing the fact predicates over
 /// `selected` / `selected_groups` / `facts`. Kept separate so tests can
 /// exercise the same surface.
@@ -184,6 +216,7 @@ fn build_context<'a>(
     selected: &'a [String],
     selected_groups: &'a [String],
     facts: &'a Facts,
+    unknown: &'a UnknownName,
 ) -> somni_expr::Context<'a> {
     let mut engine = somni_expr::Context::new();
 
@@ -200,14 +233,38 @@ fn build_context<'a>(
     }
 
     engine.add_function("option", move |cond: &str| -> bool {
+        let vocab = &facts.vocabulary.options;
+        if !vocab.is_empty() && !vocab.contains(cond) {
+            note_unknown(
+                unknown,
+                format!("unknown option `{cond}` — the template declares no such option"),
+            );
+            return false;
+        }
         selected.iter().any(|c| c == cond)
     });
 
     engine.add_function("group_selected", move |group: &str| -> bool {
+        let vocab = &facts.vocabulary.groups;
+        if !vocab.is_empty() && !vocab.contains(group) {
+            note_unknown(
+                unknown,
+                format!("unknown selection group `{group}` — the template declares no such group"),
+            );
+            return false;
+        }
         selected_groups.iter().any(|g| g == group)
     });
 
     engine.add_function("chip_has", move |symbol: &str| -> bool {
+        let vocab = &facts.vocabulary.symbols;
+        if !vocab.is_empty() && !vocab.contains(symbol) {
+            note_unknown(
+                unknown,
+                format!("unknown capability `{symbol}` — no supported chip declares it"),
+            );
+            return false;
+        }
         facts.symbols.contains(symbol)
     });
 
@@ -236,6 +293,48 @@ impl std::fmt::Display for ProcessError {
 }
 
 impl std::error::Error for ProcessError {}
+
+/// Expand `{name}` placeholders in `template` from `values`, in a **single
+/// left-to-right pass**.
+///
+/// Deliberately not "for each value, global-replace its placeholder": `values`
+/// is a `HashMap`, so that walks the keys in a randomized order, and a value
+/// that itself contains `{...}` would then expand or not depending on which key
+/// came first — the same template could render differently run to run. One pass
+/// also means a substituted value is never rescanned, so expansion can't chain.
+///
+/// An unknown name is left verbatim, matching `#REPLACE`'s
+/// "override or keep the default" idiom; an unbalanced `{` is copied through.
+fn interpolate(template: &str, values: &HashMap<String, FactValue>) -> String {
+    let mut out = String::with_capacity(template.len());
+    let mut rest = template;
+
+    while let Some(open) = rest.find('{') {
+        out.push_str(&rest[..open]);
+        let after = &rest[open + 1..];
+
+        let Some(close) = after.find('}') else {
+            // No closing brace — the remainder is literal.
+            out.push('{');
+            out.push_str(after);
+            return out;
+        };
+
+        let name = &after[..close];
+        match values.get(name) {
+            Some(value) => out.push_str(&value.to_string()),
+            None => {
+                out.push('{');
+                out.push_str(name);
+                out.push('}');
+            }
+        }
+        rest = &after[close + 1..];
+    }
+
+    out.push_str(rest);
+    out
+}
 
 /// Whether `path` is a contained relative path: not absolute and free of any
 /// `..` or drive-letter component. Used to reject `#INCLUDE_AS`/output paths
@@ -273,6 +372,8 @@ pub fn process_file(
     facts: &Facts,              // Chip-derived facts + substitution values
     file_path: &mut String,     // File path to be modified
 ) -> Result<Option<String>, ProcessError> {
+    let contents = contents.strip_prefix('\u{feff}').unwrap_or(contents);
+
     let mut res = String::new();
 
     let mut replace: Option<Vec<(&str, String)>> = None;
@@ -281,7 +382,8 @@ pub fn process_file(
     let mut include: Vec<(BlockKind, usize)> = vec![(BlockKind::Root, 0)];
     let mut file_directives = true;
 
-    let mut engine = build_context(selected, selected_groups, facts);
+    let unknown = UnknownName::default();
+    let mut engine = build_context(selected, selected_groups, facts, &unknown);
 
     let mut include_file = true;
 
@@ -297,17 +399,14 @@ pub fn process_file(
                 .or_else(|| trimmed.strip_prefix("#INCLUDEFILE "))
                 .or_else(|| trimmed.strip_prefix("--INCLUDEFILE "))
             {
-                include_file = eval_bool(&mut engine, cond, line_no, "#INCLUDEFILE")?;
+                include_file = eval_bool(&mut engine, cond, line_no, "#INCLUDEFILE", &unknown)?;
                 continue;
             } else if let Some(include_as) = trimmed
                 .strip_prefix("//INCLUDE_AS ")
                 .or_else(|| trimmed.strip_prefix("#INCLUDE_AS "))
                 .or_else(|| trimmed.strip_prefix("--INCLUDE_AS "))
             {
-                let mut include_as = include_as.trim().to_string();
-                for (key, value) in &facts.values {
-                    include_as = include_as.replace(&format!("{{{key}}}"), &value.to_string());
-                }
+                let include_as = interpolate(include_as.trim(), &facts.values);
                 if !is_safe_relative_path(&include_as) {
                     return Err(ProcessError {
                         line: line_no,
@@ -333,12 +432,19 @@ pub fn process_file(
             continue;
         }
 
+        // `#REPLACE` binds to the **next line only**. Anything else — an
+        // emitted line, a dropped one, or another directive — consumes or
+        // discards the pending replacement, so it can never survive a branch
+        // that wasn't taken and land on the first line after the `#ENDIF`.
+        let mut is_replace_directive = false;
+
         // Check if we should replace the next line with the key/value of a variable
         if let Some(what) = trimmed
             .strip_prefix("#REPLACE ")
             .or_else(|| trimmed.strip_prefix("//REPLACE "))
             .or_else(|| trimmed.strip_prefix("--REPLACE "))
         {
+            is_replace_directive = true;
             let replacements = what
                 .split(" && ")
                 .filter_map(|pair| {
@@ -365,7 +471,7 @@ pub fn process_file(
 
             // Only evaluate condition if this IF is in a branch that should be included
             let current = if active {
-                eval_bool(&mut engine, cond, line_no, "#IF")?
+                eval_bool(&mut engine, cond, line_no, "#IF", &unknown)?
             } else {
                 false
             };
@@ -376,7 +482,7 @@ pub fn process_file(
 
             // Only evaluate condition if no other branches evaluated to true
             let current = if matches!(last, BlockKind::IfElse(false, false)) {
-                eval_bool(&mut engine, cond, line_no, "#ELIF")?
+                eval_bool(&mut engine, cond, line_no, "#ELIF", &unknown)?
             } else {
                 false
             };
@@ -411,7 +517,9 @@ pub fn process_file(
 
             res.push_str(&line);
             res.push('\n');
+        }
 
+        if !is_replace_directive {
             replace = None;
         }
     }
@@ -456,8 +564,21 @@ fn eval_bool(
     cond: &str,
     line: usize,
     directive: &str,
+    unknown: &UnknownName,
 ) -> Result<bool, ProcessError> {
-    engine.evaluate::<bool>(cond).map_err(|e| ProcessError {
+    let result = engine.evaluate::<bool>(cond);
+
+    // A vocabulary miss outranks whatever the expression evaluated to — and
+    // any somni error, since "unknown capability" is the more actionable
+    // diagnostic. Taking it also clears the slot for the next condition.
+    if let Some(reason) = unknown.borrow_mut().take() {
+        return Err(ProcessError {
+            line,
+            message: format!("invalid `{directive}` condition `{cond}`: {reason}"),
+        });
+    }
+
+    result.map_err(|e| ProcessError {
         line,
         // `ExpressionError`'s `Debug` is a multi-line, ANSI-coloured caret
         // diagram whose line numbers are relative to the expression fragment,
@@ -880,6 +1001,26 @@ mod test {
     }
 
     #[test]
+    fn interpolate_handles_edge_cases() {
+        let values = HashMap::from([
+            ("a".to_string(), FactValue::Str("A".to_string())),
+            ("b".to_string(), FactValue::Int(7)),
+        ]);
+        let go = |s: &str| interpolate(s, &values);
+
+        assert_eq!(go(""), "");
+        assert_eq!(go("no placeholders"), "no placeholders");
+        assert_eq!(go("{a}"), "A");
+        assert_eq!(go("{a}{b}"), "A7"); // adjacent
+        assert_eq!(go("x/{a}/y/{b}.rs"), "x/A/y/7.rs");
+        assert_eq!(go("{unknown}"), "{unknown}");
+        assert_eq!(go("{}"), "{}"); // empty name is just unknown
+        assert_eq!(go("trailing {"), "trailing {");
+        assert_eq!(go("{a"), "{a");
+        assert_eq!(go("}{a}"), "}A"); // stray close brace
+    }
+
+    #[test]
     fn somni_identifier_classifies() {
         assert!(is_somni_identifier("chip"));
         assert!(is_somni_identifier("_private"));
@@ -972,6 +1113,347 @@ mod test {
         assert!(err.message.contains("invalid `#IF` condition"), "{err}");
         // The unknown name must be named, so the message is actionable.
         assert!(err.message.contains("definitely_not_a_fact"), "{err}");
+    }
+
+    #[test]
+    fn replace_applies_only_to_the_next_line() {
+        let mut facts = Facts::default();
+        facts.set_value("chip", "esp32c6");
+
+        // A `#REPLACE` inside a branch that is NOT taken must not survive the
+        // `#ENDIF` and hit the first line after it.
+        let out = process_file(
+            "#IF option(\"never\")\n#REPLACE PLACEHOLDER chip\nPLACEHOLDER\n#ENDIF\nPLACEHOLDER\n",
+            &[],
+            &[],
+            &facts,
+            &mut String::from("m.rs"),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(out.trim(), "PLACEHOLDER", "leaked out of a skipped branch");
+
+        // Same for a branch that IS taken but whose next line is the `#ENDIF`:
+        // the directive consumes the pending replacement either way.
+        let out = process_file(
+            "#IF option(\"yes\")\n#REPLACE PLACEHOLDER chip\n#ENDIF\nPLACEHOLDER\n",
+            &["yes".to_string()],
+            &[],
+            &facts,
+            &mut String::from("m.rs"),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(out.trim(), "PLACEHOLDER", "leaked past an `#ENDIF`");
+
+        // The ordinary case still works.
+        let out = process_file(
+            "#REPLACE PLACEHOLDER chip\nPLACEHOLDER\nPLACEHOLDER\n",
+            &[],
+            &[],
+            &facts,
+            &mut String::from("m.rs"),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            out.trim(),
+            "esp32c6\nPLACEHOLDER",
+            "should apply to exactly one line"
+        );
+    }
+
+    #[test]
+    fn include_as_interpolation_is_order_independent() {
+        for _ in 0..64 {
+            let mut facts = Facts::default();
+            facts.set_value("outer", "{inner}");
+            facts.set_value("inner", "leaf");
+            facts.set_value("chip", "esp32c6");
+
+            let mut path = String::from("orig.rs");
+            process_file(
+                "#INCLUDE_AS src/{chip}/{outer}.rs\nx\n",
+                &[],
+                &[],
+                &facts,
+                &mut path,
+            )
+            .unwrap();
+            // `{outer}` expands once; its `{inner}` is output, not re-expanded.
+            assert_eq!(path, "src/esp32c6/{inner}.rs");
+        }
+    }
+
+    #[test]
+    fn include_as_keeps_unknown_placeholders_verbatim() {
+        let mut facts = Facts::default();
+        facts.set_value("chip", "esp32c6");
+
+        let mut path = String::from("orig.rs");
+        process_file(
+            "#INCLUDE_AS src/{chip}/{nope}/{unclosed.rs\nx\n",
+            &[],
+            &[],
+            &facts,
+            &mut path,
+        )
+        .unwrap();
+        assert_eq!(path, "src/esp32c6/{nope}/{unclosed.rs");
+    }
+
+    /// Facts carrying a full vocabulary, plus one chip that has only
+    /// `soc_has_wifi` out of the two capabilities that exist.
+    fn facts_with_vocabulary() -> Facts {
+        Facts {
+            symbols: HashSet::from(["soc_has_wifi".to_string()]),
+            vocabulary: Vocabulary {
+                symbols: HashSet::from(["soc_has_wifi".to_string(), "soc_has_pcnt".to_string()]),
+                options: HashSet::from(["alloc".to_string(), "wifi".to_string()]),
+                groups: HashSet::from(["chip".to_string(), "flashing".to_string()]),
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_typo_is_distinguishable_from_an_absent_capability() {
+        let facts = facts_with_vocabulary();
+
+        // In the vocabulary but not this chip's set → plain `false`, which is
+        // the whole point of `chip_has`.
+        let out = process_file(
+            "#IF chip_has(\"soc_has_pcnt\")\nyes\n#ELSE\nno\n#ENDIF\n",
+            &[],
+            &[],
+            &facts,
+            &mut String::from("m.rs"),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(out.trim(), "no", "an absent capability must stay falsy");
+
+        // Outside the vocabulary → author error, not a silent `false`.
+        let err = process_err("#IF chip_has(\"soc_has_wfi\")\nx\n#ENDIF\n", &facts);
+        assert_eq!(err.line, 1);
+        assert!(err.message.contains("unknown capability"), "{err}");
+        assert!(err.message.contains("soc_has_wfi"), "{err}");
+    }
+
+    #[test]
+    fn unknown_option_and_group_names_are_hard_errors() {
+        let facts = facts_with_vocabulary();
+
+        // A declared-but-unselected option is falsy...
+        let out = process_file(
+            "#IF option(\"wifi\")\nyes\n#ELSE\nno\n#ENDIF\n",
+            &[],
+            &[],
+            &facts,
+            &mut String::from("m.rs"),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(out.trim(), "no");
+
+        // ...but a misspelled one is an error. `wifii` would otherwise just
+        // silently disable the block it guards.
+        let err = process_err("#IF option(\"wifii\")\nx\n#ENDIF\n", &facts);
+        assert!(err.message.contains("unknown option"), "{err}");
+        assert!(err.message.contains("wifii"), "{err}");
+
+        let err = process_err("#IF group_selected(\"flashng\")\nx\n#ENDIF\n", &facts);
+        assert!(err.message.contains("unknown selection group"), "{err}");
+
+        // The namespaces stay disjoint: a real group name is still not a real
+        // option name, and now says so instead of quietly returning false.
+        let err = process_err("#IF option(\"flashing\")\nx\n#ENDIF\n", &facts);
+        assert!(err.message.contains("unknown option"), "{err}");
+    }
+
+    #[test]
+    fn unknown_names_are_caught_in_every_condition_directive() {
+        let facts = facts_with_vocabulary();
+
+        for template in [
+            "#INCLUDEFILE chip_has(\"nope\")\nx\n",
+            "#IF chip_has(\"nope\")\nx\n#ENDIF\n",
+            "#IF option(\"alloc\")\nx\n#ELIF chip_has(\"nope\")\ny\n#ENDIF\n",
+        ] {
+            let err = process_err(template, &facts);
+            assert!(
+                err.message.contains("unknown capability"),
+                "{template:?} -> {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_vocabulary_disables_the_check() {
+        // Consumers that have no vocabulary to supply keep the permissive
+        // behaviour rather than having every name rejected.
+        let facts = Facts::default();
+        let out = process_file(
+            "#IF chip_has(\"anything\") || option(\"whatever\")\nyes\n#ELSE\nno\n#ENDIF\n",
+            &[],
+            &[],
+            &facts,
+            &mut String::from("m.rs"),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(out.trim(), "no");
+    }
+
+    #[test]
+    fn a_stale_unknown_name_does_not_leak_into_a_later_condition() {
+        // The slot is per-evaluation. A miss inside a *skipped* branch is
+        // never evaluated, so it must not surface later and misattribute the
+        // error to an innocent line.
+        let facts = facts_with_vocabulary();
+        let out = process_file(
+            "#IF option(\"alloc\")\nkept\n#ELSE\n#IF chip_has(\"bogus\")\nx\n#ENDIF\n#ENDIF\n",
+            &["alloc".to_string()],
+            &[],
+            &facts,
+            &mut String::from("m.rs"),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(out.trim(), "kept");
+    }
+
+    #[test]
+    fn non_ascii_text_survives_every_stage() {
+        // Directive parsing is byte-oriented in places (`find('{')`,
+        // `as_bytes()`), so multi-byte content must not be corrupted or panic a
+        // slice on a non-char boundary.
+        let mut facts = Facts::default();
+        facts.set_value("chip", "esp32c6");
+        facts.set_value("emoji", "🦀");
+        // A non-ASCII *name* isn't a somni identifier, so it stays
+        // `#REPLACE`-only — but it must still work there.
+        facts.set_value("café", "naïve");
+
+        // Body text is copied through byte-for-byte.
+        let out = process_file(
+            "let s = \"héllo → wörld 日本語 🦀\";\n",
+            &[],
+            &[],
+            &facts,
+            &mut String::from("m.rs"),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(out, "let s = \"héllo → wörld 日本語 🦀\";\n");
+
+        // Multi-byte `#REPLACE` pattern and value.
+        let out = process_file(
+            "#REPLACE ☃ café\nlet x = \"☃\";\n",
+            &[],
+            &[],
+            &facts,
+            &mut String::from("m.rs"),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(out.trim(), "let x = \"naïve\";");
+
+        // Multi-byte text directly adjacent to `#INCLUDE_AS` braces.
+        let mut path = String::from("orig.rs");
+        process_file(
+            "#INCLUDE_AS src/日本{chip}語/{emoji}.rs\nx\n",
+            &[],
+            &[],
+            &facts,
+            &mut path,
+        )
+        .unwrap();
+        assert_eq!(path, "src/日本esp32c6語/🦀.rs");
+
+        // And a non-ASCII string literal inside a condition.
+        let out = process_file(
+            "#IF option(\"öpt\")\nhit\n#ELSE\nmiss\n#ENDIF\n",
+            &["öpt".to_string()],
+            &[],
+            &facts,
+            &mut String::from("m.rs"),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(out.trim(), "hit");
+    }
+
+    #[test]
+    fn leading_byte_order_mark_does_not_hide_directives() {
+        // Editors on Windows happily write a UTF-8 BOM. U+FEFF is *not*
+        // `char::is_whitespace`, so `trim()` leaves it attached to the first
+        // directive — which would silently demote `#INCLUDEFILE` to literal
+        // text, emitting a file that should have been skipped (with the
+        // directive line still in it).
+        let out = process_file(
+            "\u{feff}#INCLUDEFILE false\nbody\n",
+            &[],
+            &[],
+            &Facts::default(),
+            &mut String::from("m.rs"),
+        )
+        .unwrap();
+        assert_eq!(out, None, "BOM hid the `#INCLUDEFILE`");
+
+        // Same for a block directive on the first line.
+        let out = process_file(
+            "\u{feff}#IF option(\"x\")\nbody\n#ENDIF\n",
+            &[],
+            &[],
+            &Facts::default(),
+            &mut String::from("m.rs"),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(out.trim(), "", "BOM hid the `#IF`");
+
+        // A BOM ahead of ordinary content is stripped, not emitted: it would
+        // otherwise corrupt the first token of a generated Rust/TOML file.
+        let out = process_file(
+            "\u{feff}fn main() {}\n",
+            &[],
+            &[],
+            &Facts::default(),
+            &mut String::from("m.rs"),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(out, "fn main() {}\n");
+
+        // Only the file-leading one is a BOM; mid-file U+FEFF is content.
+        let out = process_file(
+            "a\u{feff}b\n",
+            &[],
+            &[],
+            &Facts::default(),
+            &mut String::from("m.rs"),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(out, "a\u{feff}b\n");
+    }
+
+    #[test]
+    fn crlf_templates_are_recognized_and_normalized() {
+        // `str::lines()` splits off the `\r`, so directives are matched, but
+        // the emitted file is always LF — worth pinning so a future switch to
+        // manual splitting doesn't silently start leaking `\r` into output.
+        let out = process_file(
+            "a\r\n#IF option(\"x\")\r\nb\r\n#ENDIF\r\nc\r\n",
+            &[],
+            &[],
+            &Facts::default(),
+            &mut String::from("m.rs"),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(out, "a\nc\n");
     }
 
     #[test]

@@ -11,7 +11,19 @@
 //! `unknown fact` error mid-generate. The floor is computed from the max
 //! `since` over the features the template references.
 
-use std::{fmt::Display, str::FromStr};
+/// Contract versions are **strict semver**, ordering included.
+///
+/// This matters for the [`min_generator_version`] floor: semver orders
+/// `2.0.0-rc.1 < 2.0.0`, so a prerelease build of the generator does *not*
+/// satisfy a floor of `2.0.0`. A hand-rolled `major.minor.patch` type that
+/// discards the suffix would compare them equal and let an rc — which may not
+/// yet implement the feature the floor is gating — silently pass.
+///
+/// Host *tool* versions (rustc, espflash, probe-rs) are a different problem:
+/// they are reported in loose formats and their prereleases should be treated
+/// as good enough. That leniency lives in the binary's `check` module and is
+/// deliberately not shared with this type.
+pub use semver::Version;
 
 /// The `spec_version` this SDK implements. A breaking contract change bumps
 /// this; additive growth does not (it raises a template's
@@ -20,79 +32,17 @@ pub const SPEC_VERSION: u32 = 1;
 
 /// The first esp-generate release that exposes the `spec_version` 1 fact API.
 /// Every baseline v1 feature is tagged with this.
-pub const V1_BASELINE: Version = Version::new(2, 0, 0);
+pub const V1_BASELINE: Version = release(2, 0, 0);
 
-/// A three-component release version, used for the additive-feature floor.
-/// Deliberately not full semver (no pre-release / build metadata) — ordering
-/// `major.minor.patch` is all the floor comparison needs.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Hash)]
-pub struct Version {
-    pub major: u16,
-    pub minor: u16,
-    pub patch: u16,
-}
-
-impl Version {
-    pub const fn new(major: u16, minor: u16, patch: u16) -> Self {
-        Self {
-            major,
-            minor,
-            patch,
-        }
-    }
-
-    /// Parse a `major[.minor[.patch]]` string, ignoring any `-pre`/`+build`
-    /// suffix. Missing minor/patch default to 0.
-    pub fn parse(s: &str) -> Option<Self> {
-        s.parse().ok()
-    }
-
-    /// Whether `self` is at least `other`. Equivalent to `self >= *other`;
-    /// kept for call sites that read better as a question.
-    pub fn is_at_least(&self, other: &Version) -> bool {
-        self >= other
-    }
-}
-
-/// Returned when a string isn't a `major[.minor[.patch]]` version.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct ParseVersionError;
-
-impl Display for ParseVersionError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("expected a `major[.minor[.patch]]` version")
-    }
-}
-
-impl std::error::Error for ParseVersionError {}
-
-impl FromStr for Version {
-    type Err = ParseVersionError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let core = s.split(['-', '+']).next().unwrap_or(s);
-        let mut parts = core.split('.');
-        let mut component = |missing_ok: bool| -> Result<u16, ParseVersionError> {
-            match parts.next() {
-                Some(p) => p.parse().map_err(|_| ParseVersionError),
-                None if missing_ok => Ok(0),
-                None => Err(ParseVersionError),
-            }
-        };
-        let major = component(false)?;
-        let minor = component(true)?;
-        let patch = component(true)?;
-        // Reject trailing junk like "1.2.3.4".
-        if parts.next().is_some() {
-            return Err(ParseVersionError);
-        }
-        Ok(Self::new(major, minor, patch))
-    }
-}
-
-impl Display for Version {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}.{}.{}", self.major, self.minor, self.patch)
+/// A final (non-prerelease) release version, constructible in `const` context —
+/// `semver::Version::new` is not `const`.
+pub const fn release(major: u64, minor: u64, patch: u64) -> Version {
+    Version {
+        major,
+        minor,
+        patch,
+        pre: semver::Prerelease::EMPTY,
+        build: semver::BuildMetadata::EMPTY,
     }
 }
 
@@ -109,7 +59,8 @@ pub enum FeatureKind {
 }
 
 /// One contract feature, tagged with the release that introduced it.
-#[derive(Clone, Copy, Debug)]
+/// Not `Copy`: `semver::Version` owns its prerelease/build strings.
+#[derive(Clone, Debug)]
 pub struct Feature {
     /// The name a template references — the somni identifier for a predicate,
     /// or the bare directive keyword (`IF`, `REPLACE`, …) for a directive.
@@ -243,7 +194,7 @@ pub fn feature(name: &str) -> Option<&'static Feature> {
 /// contract feature. (Validation — "unknown name = hard error" — is a separate
 /// concern owned by `check`; this only answers "when was it introduced?".)
 pub fn feature_since(name: &str) -> Option<Version> {
-    feature(name).map(|f| f.since)
+    feature(name).map(|f| f.since.clone())
 }
 
 /// Compute the `min_generator_version` floor: the max `since` over the known
@@ -257,25 +208,69 @@ pub fn min_generator_version<'a>(used: impl IntoIterator<Item = &'a str>) -> Ver
         .max(V1_BASELINE)
 }
 
+/// Whether a generator at `generator` satisfies a template's
+/// `min_generator_version` floor.
+///
+/// Split out from a bare `>=` because the prerelease rule is the subtle part:
+/// semver puts `2.1.0-rc.1` *below* `2.1.0`, so an rc of the very release that
+/// introduces a feature does not clear that feature's floor. That is the
+/// intended reading — the rc may predate the feature landing.
+pub fn satisfies_floor(generator: &Version, floor: &Version) -> bool {
+    generator >= floor
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
 
     #[test]
-    fn version_parses_and_orders() {
-        assert_eq!(Version::parse("2.0.0"), Some(Version::new(2, 0, 0)));
-        assert_eq!(Version::parse("2.1"), Some(Version::new(2, 1, 0)));
-        assert_eq!(Version::parse("3"), Some(Version::new(3, 0, 0)));
-        // Suffixes are ignored.
-        assert_eq!(Version::parse("2.0.0-rc.1"), Some(Version::new(2, 0, 0)));
-        assert_eq!(Version::parse("2.0.0+build"), Some(Version::new(2, 0, 0)));
-        // Junk is rejected.
-        assert_eq!(Version::parse("2.0.0.0"), None);
-        assert_eq!(Version::parse("x"), None);
+    fn contract_versions_are_strict_semver() {
+        // Full three-component semver only: the contract is machine-authored
+        // (a template declares it, `check` computes it), so there is no reason
+        // to accept the abbreviations host tools get away with.
+        assert_eq!(Version::parse("2.0.0").unwrap(), release(2, 0, 0));
+        assert!(Version::parse("2.1").is_err());
+        assert!(Version::parse("3").is_err());
+        assert!(Version::parse("2.0.0.0").is_err());
+        assert!(Version::parse("x").is_err());
 
-        assert!(Version::new(2, 0, 0) < Version::new(2, 0, 1));
-        assert!(Version::new(2, 1, 0) > Version::new(2, 0, 9));
-        assert_eq!(Version::new(2, 0, 0).to_string(), "2.0.0");
+        assert!(release(2, 0, 0) < release(2, 0, 1));
+        assert!(release(2, 1, 0) > release(2, 0, 9));
+        assert_eq!(release(2, 0, 0).to_string(), "2.0.0");
+        assert_eq!(release(2, 0, 0), V1_BASELINE);
+    }
+
+    #[test]
+    fn a_prerelease_does_not_satisfy_a_final_release_floor() {
+        // The whole reason contract versions use semver. Stripping the suffix
+        // would make these compare equal, letting an rc of 2.0.0 — which may
+        // not yet implement the feature being gated — pass a 2.0.0 floor.
+        let rc = Version::parse("2.0.0-rc.1").unwrap();
+        assert!(rc < V1_BASELINE, "rc must sort below the final release");
+        assert!(!satisfies_floor(&rc, &V1_BASELINE));
+
+        // The final release, and anything after it, does satisfy the floor.
+        assert!(satisfies_floor(&release(2, 0, 0), &V1_BASELINE));
+        assert!(satisfies_floor(&release(2, 0, 1), &V1_BASELINE));
+        assert!(satisfies_floor(
+            &Version::parse("2.1.0-rc.1").unwrap(),
+            &V1_BASELINE
+        ));
+
+        // Prereleases order among themselves.
+        assert!(Version::parse("2.0.0-rc.1").unwrap() < Version::parse("2.0.0-rc.2").unwrap());
+        assert!(Version::parse("2.0.0-alpha").unwrap() < Version::parse("2.0.0-beta").unwrap());
+
+        // Build metadata: semver §10 excludes it from precedence, but the
+        // crate *derives* `Ord`, so it does participate — `2.0.0+a` sorts
+        // above `2.0.0`. Harmless for a floor, because empty build metadata
+        // always sorts first: carrying a `+build` suffix can only ever help a
+        // version clear a floor, never block it. Pinned so the deviation is a
+        // deliberate, recorded choice rather than a latent surprise.
+        let with_build = Version::parse("2.0.0+a").unwrap();
+        assert!(satisfies_floor(&with_build, &V1_BASELINE));
+        assert!(with_build > V1_BASELINE);
+        assert_ne!(with_build, V1_BASELINE);
     }
 
     #[test]
@@ -314,8 +309,8 @@ mod test {
     fn floor_rises_to_the_newest_feature_used() {
         // Synthetic newer feature: the floor must climb to it without coupling
         // the test to a real future feature.
-        let later = Version::new(2, 3, 0);
-        let floor = [feature_since("option").unwrap(), later]
+        let later = release(2, 3, 0);
+        let floor = [feature_since("option").unwrap(), later.clone()]
             .into_iter()
             .max()
             .unwrap();

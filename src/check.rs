@@ -8,9 +8,45 @@ use ratatui::crossterm::{
 
 use esp_metadata_generated::Chip;
 
-/// Tool/toolchain versions use the SDK's contract `Version` — one version type
-/// for the whole workspace.
-pub use esp_template_sdk::contract::Version;
+/// Host tool/toolchain versions. The *type* is shared with the SDK's contract
+/// versions (one `semver::Version` for the whole workspace), but the *parsing*
+/// is deliberately not: see [`parse_lenient`].
+pub use semver::Version;
+
+/// Parse a version reported by a host tool, or declared as a `rust-version`.
+///
+/// Strict semver is wrong here, for two reasons:
+///
+/// - **Components may be missing.** `rust-version = "1.95"` in the template's
+///   `Cargo.toml` is a valid Cargo MSRV but not a valid semver version;
+///   `Version::parse` rejects it. Missing minor/patch default to 0.
+/// - **Prereleases should pass.** Someone running `probe-rs 0.31.0-rc.1`
+///   has the features of 0.31.0 for our purposes, so the suffix is dropped
+///   rather than being allowed to sort the version below the requirement.
+///
+/// Neither leniency is acceptable for contract versions, where a prerelease
+/// sorting below a final release is the entire point of the
+/// `min_generator_version` floor — which is why that path uses
+/// `semver::Version::parse` directly and this function is not shared with it.
+pub fn parse_lenient(s: &str) -> Option<Version> {
+    let core = s.split(['-', '+']).next().unwrap_or(s);
+    let mut parts = core.split('.');
+    let mut component = |missing_ok: bool| -> Option<u64> {
+        match parts.next() {
+            Some(p) => p.parse().ok(),
+            None if missing_ok => Some(0),
+            None => None,
+        }
+    };
+    let major = component(false)?;
+    let minor = component(true)?;
+    let patch = component(true)?;
+    // Reject trailing junk like "1.2.3.4".
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(Version::new(major, minor, patch))
+}
 
 #[derive(Debug, PartialEq, Eq)]
 enum CheckResult {
@@ -61,7 +97,7 @@ pub fn check(
         &[format!("+{rust_toolchain}").as_str()],
         headless,
         Some(rust_install_cmd),
-        Some(msrv),
+        Some(msrv.clone()),
     );
 
     let espflash_version = if !probe_rs_required {
@@ -144,7 +180,7 @@ fn create_check_results(
     requirements_unsatisfied |= format_result(
         false,
         &format!("Rust ({rust_toolchain})"),
-        check_version(rust_version, msrv),
+        check_version(rust_version.as_ref(), &msrv),
         format!(
             "minimum required version is {msrv} - run `{rust_toolchain_tool} update` to upgrade"
         ),
@@ -155,7 +191,7 @@ fn create_check_results(
     requirements_unsatisfied |= format_result(
         false,
         "espflash",
-        check_version(espflash_version, Version::new(3, 3, 0)),
+        check_version(espflash_version.as_ref(), &Version::new(3, 3, 0)),
         "minimum required version is 3.3.0 - see https://crates.io/crates/espflash",
         "not found - see https://crates.io/crates/espflash for installation instructions",
         true,
@@ -164,7 +200,7 @@ fn create_check_results(
     requirements_unsatisfied |= format_result(
         !probe_rs_required,
         "probe-rs",
-        check_version(probers_version, Version::new(0, 31, 0)),
+        check_version(probers_version.as_ref(), &Version::new(0, 31, 0)),
         format!(
             "minimum {probers_suggestion_kind} version is 0.31.0 - see https://probe.rs/docs/getting-started/installation/ for how to upgrade"
         ),
@@ -177,7 +213,7 @@ fn create_check_results(
     requirements_unsatisfied |= format_result(
         true,
         "esp-config",
-        check_version(esp_config_version, Version::new(0, 5, 0)),
+        check_version(esp_config_version.as_ref(), &Version::new(0, 5, 0)),
         "minimum suggested version is 0.5.0",
         "not found - use `cargo install esp-config --features=tui --locked` to install (installation is optional)",
         probe_rs_required,
@@ -233,10 +269,10 @@ fn format_result(
     }
 }
 
-fn check_version(version: Option<Version>, required: Version) -> CheckResult {
+fn check_version(version: Option<&Version>, required: &Version) -> CheckResult {
     match version {
         Some(v) if v < required => CheckResult::WrongVersion,
-        Some(v) => CheckResult::Ok(v),
+        Some(v) => CheckResult::Ok(v.clone()),
         None => CheckResult::NotFound,
     }
 }
@@ -280,7 +316,7 @@ fn try_extract_version(cmd: &str, line: &str) -> Option<Version> {
 
     let version = parts.next()?;
 
-    version.parse().ok()
+    parse_lenient(version)
 }
 
 pub fn offensive_cargo_config_check(path: &Path) -> bool {
@@ -325,7 +361,7 @@ fn get_version_or_install(
     }
 
     match min_version {
-        Some(min) => match check_version(version, min) {
+        Some(min) => match check_version(version.as_ref(), &min) {
             CheckResult::Ok(_) => return version, // nothing to do - tool exists and version is above minimal allowed
             CheckResult::WrongVersion | CheckResult::NotFound => {
                 let Some(install_cmd) = install_cmd else {
@@ -431,52 +467,32 @@ mod tests {
     #[test]
     fn test_check_version() {
         // Ok
-        let version = Some(Version {
-            major: 1,
-            minor: 84,
-            patch: 0,
-        });
+        let version = Version::new(1, 84, 0);
         assert_eq!(
-            check_version(version, Version::new(1, 84, 0)),
-            CheckResult::Ok(Version {
-                major: 1,
-                minor: 84,
-                patch: 0,
-            })
+            check_version(Some(&version), &Version::new(1, 84, 0)),
+            CheckResult::Ok(Version::new(1, 84, 0))
         );
         // Wrong major
-        let version = Some(Version {
-            major: 0,
-            minor: 85,
-            patch: 0,
-        });
+        let version = Version::new(0, 85, 0);
         assert_eq!(
-            check_version(version, Version::new(1, 84, 0)),
+            check_version(Some(&version), &Version::new(1, 84, 0)),
             CheckResult::WrongVersion
         );
         // Wrong minor
-        let version = Some(Version {
-            major: 1,
-            minor: 83,
-            patch: 0,
-        });
+        let version = Version::new(1, 83, 0);
         assert_eq!(
-            check_version(version, Version::new(1, 84, 0)),
+            check_version(Some(&version), &Version::new(1, 84, 0)),
             CheckResult::WrongVersion
         );
         // Wrong patch
-        let version = Some(Version {
-            major: 1,
-            minor: 84,
-            patch: 0,
-        });
+        let version = Version::new(1, 84, 0);
         assert_eq!(
-            check_version(version, Version::new(1, 84, 1)),
+            check_version(Some(&version), &Version::new(1, 84, 1)),
             CheckResult::WrongVersion
         );
         // Not found
         assert_eq!(
-            check_version(None, Version::new(1, 84, 0)),
+            check_version(None, &Version::new(1, 84, 0)),
             CheckResult::NotFound
         );
     }
@@ -488,14 +504,36 @@ mod tests {
 espflash 1.7.0"#;
 
         let output = extract_version("espflash", input);
-        assert_eq!(
-            output,
-            Some(Version {
-                major: 1,
-                minor: 7,
-                patch: 0
-            })
+        assert_eq!(output, Some(Version::new(1, 7, 0)));
+    }
+
+    #[test]
+    fn lenient_parsing_accepts_what_host_tools_actually_report() {
+        // Cargo MSRVs routinely omit the patch — the bundled template's
+        // `rust-version` is one of these, and strict semver rejects it.
+        assert_eq!(parse_lenient("1.95"), Some(Version::new(1, 95, 0)));
+        assert_eq!(parse_lenient("3"), Some(Version::new(3, 0, 0)));
+        assert_eq!(parse_lenient("1.88.0"), Some(Version::new(1, 88, 0)));
+        assert!(Version::parse("1.95").is_err(), "strict semver rejects it");
+
+        // A tool prerelease is treated as its base release: someone on
+        // `probe-rs 0.31.0-rc.1` has what we need. This is the opposite of the
+        // contract-floor rule, which is exactly why the two do not share a
+        // parser.
+        assert_eq!(parse_lenient("0.31.0-rc.1"), Some(Version::new(0, 31, 0)));
+        assert_eq!(parse_lenient("3.3.0+g1234"), Some(Version::new(3, 3, 0)));
+        assert!(
+            check_version(
+                parse_lenient("0.31.0-rc.1").as_ref(),
+                &Version::new(0, 31, 0)
+            ) != CheckResult::WrongVersion,
+            "a tool rc must not be reported as too old"
         );
+
+        // Junk is still rejected rather than silently becoming 0.0.0.
+        assert_eq!(parse_lenient("1.2.3.4"), None);
+        assert_eq!(parse_lenient("x"), None);
+        assert_eq!(parse_lenient(""), None);
     }
 
     #[test]
@@ -504,37 +542,17 @@ espflash 1.7.0"#;
             create_check_results(
                 /*probe_rs_required*/ true,
                 /*msrv*/
-                Version {
-                    major: 1,
-                    minor: 88,
-                    patch: 0
-                },
+                Version::new(1, 88, 0),
                 /*rust_toolchain*/ "nightly",
                 /*rust_version*/
-                Some(Version {
-                    major: 1,
-                    minor: 88,
-                    patch: 0
-                }),
+                Some(Version::new(1, 88, 0)),
                 /*rust_toolchain_tool*/ "rustup",
                 /*espflash_version*/
-                Some(Version {
-                    major: 3,
-                    minor: 3,
-                    patch: 0
-                }),
+                Some(Version::new(3, 3, 0)),
                 /*probers_version*/
-                Some(Version {
-                    major: 0,
-                    minor: 31,
-                    patch: 0
-                }),
+                Some(Version::new(0, 31, 0)),
                 /*esp_config_version*/
-                Some(Version {
-                    major: 0,
-                    minor: 5,
-                    patch: 0
-                }),
+                Some(Version::new(0, 5, 0)),
                 /*probers_suggestion_kind*/ "required",
             ),
             "
@@ -554,32 +572,16 @@ Checking installed versions
             create_check_results(
                 /*probe_rs_required*/ false,
                 /*msrv*/
-                Version {
-                    major: 1,
-                    minor: 88,
-                    patch: 0
-                },
+                Version::new(1, 88, 0),
                 /*rust_toolchain*/ "nightly",
                 /*rust_version*/
-                Some(Version {
-                    major: 1,
-                    minor: 88,
-                    patch: 0
-                }),
+                Some(Version::new(1, 88, 0)),
                 /*rust_toolchain_tool*/ "rustup",
                 /*espflash_version*/
-                Some(Version {
-                    major: 3,
-                    minor: 3,
-                    patch: 0
-                }),
+                Some(Version::new(3, 3, 0)),
                 /*probers_version*/ None,
                 /*esp_config_version*/
-                Some(Version {
-                    major: 0,
-                    minor: 5,
-                    patch: 0
-                }),
+                Some(Version::new(0, 5, 0)),
                 /*probers_suggestion_kind*/ "suggested",
             ),
             "
@@ -599,11 +601,7 @@ Checking installed versions
             create_check_results(
                 /*probe_rs_required*/ true,
                 /*msrv*/
-                Version {
-                    major: 1,
-                    minor: 88,
-                    patch: 0
-                },
+                Version::new(1, 88, 0),
                 /*rust_toolchain*/ "stable",
                 /*rust_version*/ None,
                 /*rust_toolchain_tool*/ "rustup",

@@ -24,6 +24,7 @@ use std::{
     sync::LazyLock,
     time::Duration,
 };
+use strum::IntoEnumIterator;
 use taplo::formatter::Options;
 
 use esp_generate::template_files::TEMPLATE_FILES;
@@ -442,7 +443,12 @@ fn main() -> Result<()> {
         esp_hal_version.clone()
     };
 
-    let msrv: check::Version = versions.msrv().parse().unwrap();
+    // `rust-version` is a Cargo MSRV, not strict semver — `1.95` is legal and
+    // has no patch component, so it goes through the lenient tool parser.
+    let msrv_raw = versions.msrv();
+    let Some(msrv) = check::parse_lenient(msrv_raw) else {
+        bail!("template `Cargo.toml` has an unparsable `rust-version`: `{msrv_raw}`");
+    };
 
     // Start toolchain scan as early as possible (TUI only). The scan itself is
     // chip-agnostic — chip/MSRV/CLI hint are applied later by
@@ -508,7 +514,12 @@ fn main() -> Result<()> {
         initial_selected.push(tc.clone());
     }
 
-    let repository = tui::Repository::new(initial_options, &initial_selected);
+    // `initial_selections` is already a group → pick map built off the pristine
+    // template, so the chip is a direct lookup here.
+    let initial_facts =
+        chip_from_name(initial_selections.get("chip").map(String::as_str)).map(Chip::facts);
+
+    let repository = tui::Repository::new(initial_options, &initial_selected, initial_facts);
 
     let (selected, flat_options) = if !args.headless {
         let mut app = tui::App::new(repository, TEMPLATE.required.clone());
@@ -563,17 +574,23 @@ fn main() -> Result<()> {
             let scan_needs_reflecting = scan_finished && !populated_with_scan;
 
             if signature_changed || scan_needs_reflecting {
+                let chip = chip_from_name(current_compat.get("chip").map(String::as_str));
+
                 let filtered = toolchain::toolchains_for_chip(
                     &cached_toolchains,
-                    current_compat
-                        .get("chip")
-                        .and_then(|name| name.parse().ok()),
+                    chip,
                     &msrv,
                     args.toolchain.as_deref(),
                 );
                 for warning in &filtered.warnings {
                     log::warn!("{warning}");
                 }
+
+                // Facts before options: both cascade out selections that no
+                // longer hold, and the cascade must run against the *new*
+                // chip's capabilities. Installing the tree first would drop
+                // options using the outgoing chip's symbol set.
+                app.repository.config.set_facts(chip.map(Chip::facts));
 
                 let new_options = build_options(
                     &current_compat,
@@ -669,35 +686,38 @@ fn main() -> Result<()> {
     // `set_value` keeps the first writer, so binary facts below take precedence
     // over template-scoped `sets` merged later — a template can't shadow `chip`,
     // `project_name`, etc.
-    let mut facts = process::Facts::default();
+    let chip = chip_from_name(selected_chip_name(&selected, &flat_options));
+    let mut facts = chip.map(Chip::facts).unwrap_or_default();
+
+    // The vocabularies behind the unknown-name hard error. Each is the set of
+    // names that could be true for *some* chip or selection, so a misspelling
+    // is distinguishable from a name that is simply not true right now.
+    facts.vocabulary.symbols = Chip::iter()
+        .flat_map(|c| c.metadata().all_symbols())
+        .map(|s| s.to_string())
+        .collect();
+    facts.vocabulary.options = TEMPLATE
+        .all_options()
+        .iter()
+        .map(|o| o.name.clone())
+        .chain(flat_options.iter().map(|o| o.name.clone()))
+        .collect();
+    facts.vocabulary.groups = TEMPLATE
+        .all_options()
+        .iter()
+        .map(|o| o.selection_group.clone())
+        .chain(flat_options.iter().map(|o| o.selection_group.clone()))
+        .filter(|g| !g.is_empty())
+        .collect();
     facts.set_value("generate_version", env!("CARGO_PKG_VERSION"));
     facts.set_value("project_name", name.clone());
     facts.set_value("generate_parameters", selected_options);
     facts.set_value("esp_hal_version_full", esp_hal_version_full);
 
-    // Chip-specific facts back `chip_has(...)` and `is_xtensa`/`is_riscv`.
-    if let Some(chip) = selected.iter().find(|name| {
-        find_option(name, &flat_options).is_some_and(|(_, opt)| opt.selection_group == "chip")
-    }) {
-        let chip: Chip = chip
-            .parse()
-            .unwrap_or_else(|_| panic!("Not a valid chip name"));
-        facts.set_value("chip", chip.to_string());
-        // Int-typed so `#IF dram2_uninit_size > 0` works; `#REPLACE` still
-        // splices the decimal form.
-        facts.set_value("dram2_uninit_size", chip.dram2_region().size());
-        facts.set_value("rust_target", chip.metadata().target());
-
-        facts.symbols = chip
-            .metadata()
-            .all_symbols()
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-
-        facts.is_xtensa = chip.metadata().is_xtensa();
-        facts.is_riscv = !facts.is_xtensa;
-
+    // The remaining chip-dependent facts also depend on the rest of the
+    // selection (the picked module's reserved pins, the toolchain), so they
+    // can't live in `Chip::facts`.
+    if let Some(chip) = chip {
         if let Some(tc) = selected_toolchain.as_ref() {
             facts.set_value("rust_toolchain", tc.clone());
         }
@@ -925,11 +945,13 @@ fn process_options(template: &Template, args: &Args) -> Result<()> {
         .flat_map(|opt_name| flat_options.iter().position(|o| &o.name == opt_name))
         .collect();
 
+    let facts = chip_from_name(selected_chip_name(&args.option, &flat_options)).map(Chip::facts);
+
     let selected_config = ActiveConfiguration {
         selected,
         flat_options,
         options: template.options.clone(),
-        facts: None,
+        facts,
     };
 
     let mut same_selection_group: HashMap<&str, Vec<&str>> = HashMap::new();
@@ -1031,6 +1053,40 @@ fn process_options(template: &Template, args: &Args) -> Result<()> {
     }
 }
 
+/// The name of the option picked in the `chip` selection group, if any.
+///
+/// Resolved through the option tree rather than by parsing names: `chip` is an
+/// ordinary selection group, so membership in it — not the spelling of the name
+/// — is what makes an option a chip.
+fn selected_chip_name<'a>(
+    selected: &'a [String],
+    flat_options: &[GeneratorOption],
+) -> Option<&'a str> {
+    selected
+        .iter()
+        .find(|name| {
+            find_option(name, flat_options).is_some_and(|(_, opt)| opt.selection_group == "chip")
+        })
+        .map(String::as_str)
+}
+
+/// Parse a `chip` group pick into the [`Chip`] it names.
+///
+/// `None` — and, following the same convention as
+/// [`prune_incompatible_options`], the empty string that
+/// [`ActiveConfiguration::compatibility_signature`] reports for a group with no
+/// pick — means no chip has been selected yet.
+///
+/// Any other name is infallible: [`chip_selector::validate_chip_category`]
+/// rejects, at [`TEMPLATE`] load, any option in the `chip` group whose name is
+/// not a `Chip` variant.
+fn chip_from_name(name: Option<&str>) -> Option<Chip> {
+    name.filter(|name| !name.is_empty()).map(|name| {
+        name.parse()
+            .expect("chip category is validated when TEMPLATE loads")
+    })
+}
+
 fn should_initialize_git_repo(mut path: &Path) -> bool {
     loop {
         let dotgit_path = path.join(".git");
@@ -1046,4 +1102,35 @@ fn should_initialize_git_repo(mut path: &Path) -> bool {
     }
 
     true
+}
+
+#[cfg(test)]
+mod test {
+    use esp_generate::config::flatten_options;
+
+    use super::*;
+
+    /// The TUI's normal startup state is "no chip picked yet", which
+    /// `compatibility_signature` reports as an *empty string*, not an absent
+    /// key. Treating that as a name to parse would panic on launch.
+    #[test]
+    fn an_unpicked_chip_group_is_not_a_chip_name() {
+        assert_eq!(chip_from_name(None), None);
+        assert_eq!(chip_from_name(Some("")), None);
+        assert_eq!(chip_from_name(Some("esp32c6")), Some(Chip::Esp32c6));
+    }
+
+    /// A chip is whatever sits in the `chip` selection group — not whatever
+    /// happens to spell like one. Run against the real bundled template so the
+    /// lookup can't drift from `template.yaml`.
+    #[test]
+    fn only_an_option_in_the_chip_group_names_a_chip() {
+        let flat = flatten_options(&TEMPLATE.options);
+
+        let selected = vec!["alloc".to_string(), "esp32h2".to_string()];
+        assert_eq!(selected_chip_name(&selected, &flat), Some("esp32h2"));
+
+        assert_eq!(selected_chip_name(&["alloc".to_string()], &flat), None);
+        assert_eq!(selected_chip_name(&[], &flat), None);
+    }
 }

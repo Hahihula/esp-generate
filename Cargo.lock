@@ -497,6 +497,7 @@ dependencies = [
  "log",
  "quote",
  "ratatui",
+ "semver",
  "serde",
  "serde_yaml",
  "somni-expr",
@@ -519,6 +520,7 @@ version = "0.1.0"
 dependencies = [
  "indexmap",
  "log",
+ "semver",
  "serde",
  "serde_yaml",
  "somni-expr",

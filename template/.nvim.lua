@@ -1,4 +1,4 @@
---INCLUDEFILE option("neovim")
+--INCLUDEFILE group_selected("neovim")
 -- You must enable the exrc setting in neovim for this config file to be used.
 local rust_analyzer = {
     cargo = {
