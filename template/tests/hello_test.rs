@@ -1,4 +1,4 @@
-//INCLUDEFILE !option("embassy") && option("embedded-test")
+//%includefile !option("embassy") && option("embedded-test")
 //! Demo test suite using embedded-test
 //!
 //! You can run this using `cargo test` as usual.
@@ -11,25 +11,25 @@ esp_bootloader_esp_idf::esp_app_desc!();
 #[cfg(test)]
 #[embedded_test::tests]
 mod tests {
-    //IF option("defmt")
+    //%if option("defmt")
     use defmt::assert_eq;
-    //ENDIF
+    //%endif
     use esp_hal as _;
 
     #[init]
     fn init() {
         let _ = esp_hal::init(esp_hal::Config::default());
 
-        //IF option("defmt")
+        //%if option("defmt")
         rtt_target::rtt_init_defmt!();
-        //ENDIF
+        //%endif
     }
 
     #[test]
     fn hello_test() {
-        //IF option("defmt")
+        //%if option("defmt")
         defmt::info!("Running test!");
-        //ENDIF
+        //%endif
 
         assert_eq!(1 + 1, 2);
     }

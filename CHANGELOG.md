@@ -16,6 +16,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - The template contract (option tree, relationship engine, directive processor) now lives in a separate `esp-template-sdk` crate. Generated projects are unchanged. (#352)
+- **Template syntax.** File directives are now rendered by [`somni-template`](https://docs.rs/somni-template). Directive lines are marked with the file's comment prefix plus `%` (`#%if`, `//%endif`, `--%else`) so ordinary comments are never parsed as directives; `#ELIF` is now `#%else if`; and `#REPLACE` is replaced by `{{ expr }}` interpolation. `#%includefile` and `#%include_as` are unchanged apart from the marker. Generated projects are unchanged. (#352)
+- `sets` keys that a template interpolates must be valid identifiers: `wokwi-board` is now `wokwi_board`, and `coding-agent-guidance-file` is now `coding_agent_guidance_file`. (#352)
 - Template directives evaluate against a single fact API: `is_xtensa`/`is_riscv`/`has_reserved_pins`/`chip_has()` replace the old pseudo-options, and values such as `chip` and `dram2_uninit_size` can now be used in `#IF` conditions. Value names are `snake_case`. (#352)
 - `option()` no longer matches selection-group names — use `group_selected()`. (#352)
 - Chip selector has been moved to the TUI. (#328)

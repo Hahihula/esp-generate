@@ -6,6 +6,7 @@ use ratatui::crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode},
 };
 
+use esp_generate::contract;
 use esp_metadata_generated::Chip;
 
 /// Host tool/toolchain versions. The *type* is shared with the SDK's contract
@@ -25,28 +26,35 @@ pub use semver::Version;
 ///   rather than being allowed to sort the version below the requirement.
 ///
 /// Neither leniency is acceptable for contract versions, where a prerelease
-/// sorting below a final release is the entire point of the
-/// `min_generator_version` floor — which is why that path uses
+/// sorting below a final release is the entire point of
+/// `contract::is_compatible` — which is why that path uses
 /// `semver::Version::parse` directly and this function is not shared with it.
 pub fn parse_lenient(s: &str) -> Option<Version> {
-    let core = s.split(['-', '+']).next().unwrap_or(s);
+    let core = s.split(['-', '+']).next()?;
     let mut parts = core.split('.');
-    let mut component = |missing_ok: bool| -> Option<u64> {
-        match parts.next() {
-            Some(p) => p.parse().ok(),
-            None if missing_ok => Some(0),
-            None => None,
-        }
-    };
-    let major = component(false)?;
-    let minor = component(true)?;
-    let patch = component(true)?;
+
+    let major: u64 = parts.next()?.parse().ok()?;
+    let minor = parts.next().map_or(Some(0), |p| p.parse().ok())?;
+    let patch = parts.next().map_or(Some(0), |p| p.parse().ok())?;
+
     // Reject trailing junk like "1.2.3.4".
     if parts.next().is_some() {
         return None;
     }
+
     Some(Version::new(major, minor, patch))
 }
+
+/// Minimum versions the generator pre-flights, declared once so the check, the
+/// install prompt, and the help text cannot drift apart. `esp-config` is
+/// advisory; the rest gate generation when their tool is required.
+///
+/// (`contract::release` is borrowed only as a `const` constructor —
+/// `Version::new` is not `const`. These are host-tool versions, and the
+/// leniency/strictness split described on [`parse_lenient`] still applies.)
+const ESPFLASH_MIN: Version = contract::release(3, 3, 0);
+const PROBE_RS_MIN: Version = contract::release(0, 31, 0);
+const ESP_CONFIG_MIN: Version = contract::release(0, 5, 0);
 
 #[derive(Debug, PartialEq, Eq)]
 enum CheckResult {
@@ -106,7 +114,7 @@ pub fn check(
             &[],
             headless,
             Some(&["cargo", "install", "espflash", "--locked"]),
-            Some(Version::new(3, 3, 0)),
+            Some(ESPFLASH_MIN),
         )
     } else {
         get_version("espflash", &[])
@@ -118,7 +126,7 @@ pub fn check(
             &[],
             headless,
             Some(&["cargo", "install", "probe-rs-tools", "--locked"]),
-            Some(Version::new(0, 31, 0)),
+            Some(PROBE_RS_MIN),
         )
     } else {
         get_version("probe-rs", &[])
@@ -135,7 +143,7 @@ pub fn check(
             "--features=tui",
             "--locked",
         ]),
-        Some(Version::new(0, 5, 0)),
+        Some(ESP_CONFIG_MIN),
     );
 
     let probers_suggestion_kind = if probe_rs_required {
@@ -191,8 +199,10 @@ fn create_check_results(
     requirements_unsatisfied |= format_result(
         false,
         "espflash",
-        check_version(espflash_version.as_ref(), &Version::new(3, 3, 0)),
-        "minimum required version is 3.3.0 - see https://crates.io/crates/espflash",
+        check_version(espflash_version.as_ref(), &ESPFLASH_MIN),
+        format!(
+            "minimum required version is {ESPFLASH_MIN} - see https://crates.io/crates/espflash"
+        ),
         "not found - see https://crates.io/crates/espflash for installation instructions",
         true,
         &mut result,
@@ -200,9 +210,9 @@ fn create_check_results(
     requirements_unsatisfied |= format_result(
         !probe_rs_required,
         "probe-rs",
-        check_version(probers_version.as_ref(), &Version::new(0, 31, 0)),
+        check_version(probers_version.as_ref(), &PROBE_RS_MIN),
         format!(
-            "minimum {probers_suggestion_kind} version is 0.31.0 - see https://probe.rs/docs/getting-started/installation/ for how to upgrade"
+            "minimum {probers_suggestion_kind} version is {PROBE_RS_MIN} - see https://probe.rs/docs/getting-started/installation/ for how to upgrade"
         ),
         format!(
             "not found - see https://probe.rs/docs/getting-started/installation/ for how to install ({probers_suggestion_kind})"
@@ -213,8 +223,8 @@ fn create_check_results(
     requirements_unsatisfied |= format_result(
         true,
         "esp-config",
-        check_version(esp_config_version.as_ref(), &Version::new(0, 5, 0)),
-        "minimum suggested version is 0.5.0",
+        check_version(esp_config_version.as_ref(), &ESP_CONFIG_MIN),
+        format!("minimum suggested version is {ESP_CONFIG_MIN}"),
         "not found - use `cargo install esp-config --features=tui --locked` to install (installation is optional)",
         probe_rs_required,
         &mut result,
@@ -548,11 +558,11 @@ espflash 1.7.0"#;
                 Some(Version::new(1, 88, 0)),
                 /*rust_toolchain_tool*/ "rustup",
                 /*espflash_version*/
-                Some(Version::new(3, 3, 0)),
+                Some(ESPFLASH_MIN),
                 /*probers_version*/
-                Some(Version::new(0, 31, 0)),
+                Some(PROBE_RS_MIN),
                 /*esp_config_version*/
-                Some(Version::new(0, 5, 0)),
+                Some(ESP_CONFIG_MIN),
                 /*probers_suggestion_kind*/ "required",
             ),
             "
@@ -578,10 +588,10 @@ Checking installed versions
                 Some(Version::new(1, 88, 0)),
                 /*rust_toolchain_tool*/ "rustup",
                 /*espflash_version*/
-                Some(Version::new(3, 3, 0)),
+                Some(ESPFLASH_MIN),
                 /*probers_version*/ None,
                 /*esp_config_version*/
-                Some(Version::new(0, 5, 0)),
+                Some(ESP_CONFIG_MIN),
                 /*probers_suggestion_kind*/ "suggested",
             ),
             "

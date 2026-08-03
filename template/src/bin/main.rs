@@ -1,4 +1,4 @@
-//INCLUDEFILE !option("embassy")
+//%includefile !option("embassy")
 #![no_std]
 #![no_main]
 #![deny(
@@ -13,51 +13,51 @@ use esp_hal::{
     main,
     time::{Duration, Instant},
 };
-//IF option("defmt")
-//IF !option("probe-rs")
+//%if option("defmt")
+//%if !option("probe-rs")
 //+use esp_println as _;
-//ENDIF
+//%endif
 //+use defmt::info;
-//IF !group_selected("panic-handler")
+//%if !group_selected("panic-handler")
 //+use defmt::error;
-//ENDIF !group_selected("panic-handler")
-//ELIF option("log")
+//%endif !group_selected("panic-handler")
+//%else if option("log")
 use log::info;
-//IF !group_selected("panic-handler")
+//%if !group_selected("panic-handler")
 use log::error;
-//ENDIF !group_selected("panic-handler")
-//ELIF option("probe-rs") // without defmt
+//%endif !group_selected("panic-handler")
+//%else if option("probe-rs")
 //+use rtt_target::rprintln;
-//ENDIF !defmt
+//%endif !defmt
 
-//IF !group_selected("panic-handler")
-//IF option("defmt") || option("log")
+//%if !group_selected("panic-handler")
+//%if option("defmt") || option("log")
 //+#[panic_handler]
 //+fn panic(panic_info: &core::panic::PanicInfo) -> ! {
 //+    error!("{}", panic_info);
 //+    loop {}
 //+}
-//ELIF option("probe-rs")
+//%else if option("probe-rs")
 //+#[panic_handler]
 //+fn panic(panic_info: &core::panic::PanicInfo) -> ! {
 //+    rprintln!("{}", panic_info);
 //+    loop {}
 //+}
-//ELSE
+//%else
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
     loop {}
 }
-//ENDIF
-//ELIF option("esp-backtrace")
+//%endif
+//%else if option("esp-backtrace")
 //+use esp_backtrace as _;
-//ELIF option("panic-rtt-target")
+//%else if option("panic-rtt-target")
 //+use panic_rtt_target as _;
-//ENDIF
+//%endif
 
-//IF option("alloc")
+//%if option("alloc")
 extern crate alloc;
-//ENDIF
+//%endif
 
 // This creates a default app-descriptor required by the esp-idf bootloader.
 // For more information see: <https://docs.espressif.com/projects/esp-idf/en/stable/esp32/api-reference/system/app_image_format.html#application-description>
@@ -69,46 +69,41 @@ esp_bootloader_esp_idf::esp_app_desc!();
 )]
 #[main]
 fn main() -> ! {
-    //REPLACE generate-version generate_version
-    // generator version: generate-version
-    //REPLACE generate-parameters generate_parameters
-    // generator parameters: generate-parameters
+    // generator version: {{ generate_version }}
+    // generator parameters: {{ generate_parameters }}
 
-    //IF option("probe-rs")
-    //IF option("defmt")
+    //%if option("probe-rs")
+    //%if option("defmt")
     rtt_target::rtt_init_defmt!();
-    //ELSE
+    //%else
     rtt_target::rtt_init_print!();
-    //ENDIF
-    //ELIF option("log")
+    //%endif
+    //%else if option("log")
     esp_println::logger::init_logger_from_env();
-    //ENDIF
+    //%endif
 
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
-    //IF has_reserved_pins
+    //%if has_reserved_pins
     let peripherals = esp_hal::init(config);
-    //ELSE
+    //%else
     //+let _peripherals = esp_hal::init(config);
-    //ENDIF
+    //%endif
 
-    //REPLACE __RESERVED_GPIO_CODE__; reserved_gpio_code
-    __RESERVED_GPIO_CODE__;
+    {{ reserved_gpio_code }}
 
-    //IF option("alloc")
-    //REPLACE 65536 dram2_uninit_size
-    esp_alloc::heap_allocator!(#[esp_hal::ram(reclaimed)] size: 65536);
-    //ENDIF alloc
+    //%if option("alloc")
+    esp_alloc::heap_allocator!(#[esp_hal::ram(reclaimed)] size: {{ str(dram2_uninit_size) }});
+    //%endif alloc
 
     loop {
-        //IF option("defmt") || option("log")
+        //%if option("defmt") || option("log")
         info!("Hello world!");
-        //ELIF option("probe-rs") // without defmt
+        //%else if option("probe-rs")
         rprintln!("Hello world!");
-        //ENDIF
+        //%endif
         let delay_start = Instant::now();
         while delay_start.elapsed() < Duration::from_millis(500) {}
     }
 
-    //REPLACE {current-version} esp_hal_version_full
-    // for inspiration have a look at the examples at https://github.com/esp-rs/esp-hal/tree/esp-hal-v{current-version}/examples
+    // for inspiration have a look at the examples at https://github.com/esp-rs/esp-hal/tree/esp-hal-v{{ esp_hal_version_full }}/examples
 }

@@ -1,4 +1,4 @@
-#INCLUDEFILE false
+#%includefile false
 
 !Category
 name: chip
@@ -11,7 +11,7 @@ options:
     display_name: ESP32
     selection_group: chip
     sets:
-      wokwi-board: board-esp32-devkit-c-v4
+      wokwi_board: board-esp32-devkit-c-v4
   - !Option
     name: esp32c2
     display_name: ESP32-C2
@@ -21,7 +21,7 @@ options:
     display_name: ESP32-C3
     selection_group: chip
     sets:
-      wokwi-board: board-esp32-c3-devkitm-1
+      wokwi_board: board-esp32-c3-devkitm-1
   - !Option
     name: esp32c5
     display_name: ESP32-C5
@@ -31,7 +31,7 @@ options:
     display_name: ESP32-C6
     selection_group: chip
     sets:
-      wokwi-board: board-esp32-c6-devkitc-1
+      wokwi_board: board-esp32-c6-devkitc-1
   - !Option
     name: esp32c61
     display_name: ESP32-C61
@@ -41,16 +41,16 @@ options:
     display_name: ESP32-H2
     selection_group: chip
     sets:
-      wokwi-board: board-esp32-h2-devkitm-1
+      wokwi_board: board-esp32-h2-devkitm-1
   - !Option
     name: esp32s2
     display_name: ESP32-S2
     selection_group: chip
     sets:
-      wokwi-board: board-esp32-s2-devkitm-1
+      wokwi_board: board-esp32-s2-devkitm-1
   - !Option
     name: esp32s3
     display_name: ESP32-S3
     selection_group: chip
     sets:
-      wokwi-board: board-esp32-s3-devkitc-1
+      wokwi_board: board-esp32-s3-devkitc-1

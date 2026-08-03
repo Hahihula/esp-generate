@@ -516,8 +516,7 @@ fn main() -> Result<()> {
 
     // `initial_selections` is already a group → pick map built off the pristine
     // template, so the chip is a direct lookup here.
-    let initial_facts =
-        chip_from_name(initial_selections.get("chip").map(String::as_str)).map(Chip::facts);
+    let initial_facts = chip_from_name(group_pick(&initial_selections, "chip")).map(Chip::facts);
 
     let repository = tui::Repository::new(initial_options, &initial_selected, initial_facts);
 
@@ -574,7 +573,7 @@ fn main() -> Result<()> {
             let scan_needs_reflecting = scan_finished && !populated_with_scan;
 
             if signature_changed || scan_needs_reflecting {
-                let chip = chip_from_name(current_compat.get("chip").map(String::as_str));
+                let chip = chip_from_name(group_pick(&current_compat, "chip"));
 
                 let filtered = toolchain::toolchains_for_chip(
                     &cached_toolchains,
@@ -721,6 +720,13 @@ fn main() -> Result<()> {
         if let Some(tc) = selected_toolchain.as_ref() {
             facts.set_value("rust_toolchain", tc.clone());
         }
+        // `rust-toolchain.toml` used to carry the per-ISA default inline, which
+        // only worked because a missing substitution left the literal in place.
+        // Interpolation has no such fallback, so the default lives here — where
+        // the ISA is actually known. `set_value` keeps the first writer, so an
+        // explicitly selected toolchain still wins.
+        let default_toolchain = if facts.is_xtensa { "esp" } else { "stable" };
+        facts.set_value("rust_toolchain", default_toolchain);
 
         let mut reserved_gpio_code = String::new();
 
@@ -1070,21 +1076,43 @@ fn selected_chip_name<'a>(
         .map(String::as_str)
 }
 
-/// Parse a `chip` group pick into the [`Chip`] it names.
+/// The option picked for `group` in a compatibility signature, or `None` when
+/// the group has no pick.
 ///
-/// `None` — and, following the same convention as
-/// [`prune_incompatible_options`], the empty string that
-/// [`ActiveConfiguration::compatibility_signature`] reports for a group with no
-/// pick — means no chip has been selected yet.
+/// [`ActiveConfiguration::compatibility_signature`] reports an unpicked group
+/// as the **empty string** rather than omitting the key. This is the single
+/// place that translation happens, so every other function can treat a name it
+/// receives as a real one.
+fn group_pick<'a>(signature: &'a HashMap<String, String>, group: &str) -> Option<&'a str> {
+    signature
+        .get(group)
+        .map(String::as_str)
+        .filter(|name| !name.is_empty())
+}
+
+/// Parse a `chip` group pick into the [`Chip`] it names. `None` means no chip
+/// has been selected.
 ///
-/// Any other name is infallible: [`chip_selector::validate_chip_category`]
-/// rejects, at [`TEMPLATE`] load, any option in the `chip` group whose name is
-/// not a `Chip` variant.
+/// Every non-`None` name is required to be a real one, and is infallible:
+/// [`chip_selector::validate_chip_category`] rejects, at [`TEMPLATE`] load, any
+/// option in the `chip` group whose name is not a `Chip` variant — `""`
+/// included, since it parses as no variant.
+///
+/// The empty string is therefore *not* accepted as a spelling of "no chip".
+/// Silently mapping it to `None` here would mean any future path that produced
+/// an empty name — a signature read without [`group_pick`], a malformed option
+/// — would quietly disable `requires_capabilities` gating instead of failing.
 fn chip_from_name(name: Option<&str>) -> Option<Chip> {
-    name.filter(|name| !name.is_empty()).map(|name| {
+    let name = name?;
+    assert!(
+        !name.is_empty(),
+        "an unpicked selection group must arrive as `None`, not `\"\"` — \
+         read compatibility signatures through `group_pick`"
+    );
+    Some(
         name.parse()
-            .expect("chip category is validated when TEMPLATE loads")
-    })
+            .expect("chip category is validated when TEMPLATE loads"),
+    )
 }
 
 fn should_initialize_git_repo(mut path: &Path) -> bool {
@@ -1112,12 +1140,56 @@ mod test {
 
     /// The TUI's normal startup state is "no chip picked yet", which
     /// `compatibility_signature` reports as an *empty string*, not an absent
-    /// key. Treating that as a name to parse would panic on launch.
+    /// key. `group_pick` is the one place that gets normalised.
     #[test]
-    fn an_unpicked_chip_group_is_not_a_chip_name() {
+    fn an_unpicked_group_reads_as_no_pick() {
+        let mut signature = HashMap::new();
+        signature.insert("chip".to_string(), String::new());
+        assert_eq!(group_pick(&signature, "chip"), None, "unpicked group");
+        assert_eq!(group_pick(&signature, "absent"), None, "absent key");
+
+        signature.insert("chip".to_string(), "esp32c6".to_string());
+        assert_eq!(group_pick(&signature, "chip"), Some("esp32c6"));
+    }
+
+    /// End-to-end against the *real* producer: the TUI's state before the user
+    /// picks a chip. This is the path the invariant could plausibly break, so
+    /// it pins both halves — that a signature really does report `""`, and that
+    /// reading it through `group_pick` keeps `chip_from_name` from asserting.
+    #[test]
+    fn the_tui_startup_signature_does_not_trip_the_invariant() {
+        let options = TEMPLATE.options.clone();
+        let flat_options = flatten_options(&options);
+        let config = ActiveConfiguration {
+            selected: Vec::new(),
+            flat_options,
+            options,
+            facts: None,
+        };
+
+        let signature = config.compatibility_signature(&["chip".to_string()]);
+        assert_eq!(
+            signature.get("chip").map(String::as_str),
+            Some(""),
+            "precondition: an unpicked group is reported as an empty string"
+        );
+
+        assert_eq!(chip_from_name(group_pick(&signature, "chip")), None);
+    }
+
+    #[test]
+    fn chip_from_name_resolves_real_names() {
         assert_eq!(chip_from_name(None), None);
-        assert_eq!(chip_from_name(Some("")), None);
         assert_eq!(chip_from_name(Some("esp32c6")), Some(Chip::Esp32c6));
+    }
+
+    /// An empty name is a bug, not a spelling of "no chip". Accepting it would
+    /// let any path that lost track of the signature convention silently
+    /// disable `requires_capabilities` gating rather than fail.
+    #[test]
+    #[should_panic(expected = "must arrive as `None`")]
+    fn chip_from_name_rejects_the_unpicked_sentinel() {
+        chip_from_name(Some(""));
     }
 
     /// A chip is whatever sits in the `chip` selection group — not whatever

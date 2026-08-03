@@ -1,11 +1,10 @@
-//INCLUDEFILE option("wokwi")
+//%includefile option("wokwi")
 {
     "version": 1,
     "editor": "wokwi",
     "parts": [
         {
-            //REPLACE wokwi-board wokwi-board
-            "type": "wokwi-board",
+            "type": "{{ wokwi_board }}",
             "id": "esp",
             "top": 0.59,
             "left": 0.67,

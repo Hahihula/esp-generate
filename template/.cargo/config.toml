@@ -1,39 +1,34 @@
 # Keep compilation settings in this file and user/runtime settings in `esp-config.toml`.
 include = ["esp-config.toml"]
 
-#REPLACE riscv32imac-unknown-none-elf rust_target
-[target.riscv32imac-unknown-none-elf]
-#IF option("probe-rs")
-#REPLACE esp32c6 chip
-runner = "probe-rs run --chip=esp32c6 --preverify --always-print-stacktrace --no-location"
-#ELIF option("defmt")
-#REPLACE esp32c6 chip
-#+runner = "espflash flash --monitor --chip esp32c6 --log-format defmt"
-#ELSE
-#REPLACE esp32c6 chip
-#+runner = "espflash flash --monitor --chip esp32c6"
-#ENDIF
+[target.{{ rust_target }}]
+#%if option("probe-rs")
+runner = "probe-rs run --chip={{ chip }} --preverify --always-print-stacktrace --no-location"
+#%else if option("defmt")
+#+runner = "espflash flash --monitor --chip {{ chip }} --log-format defmt"
+#%else
+#+runner = "espflash flash --monitor --chip {{ chip }}"
+#%endif
 
 [build]
 rustflags = [
-#IF is_xtensa
+#%if is_xtensa
   "-C", "link-arg=-nostartfiles",
-#ELIF is_riscv
+#%else if is_riscv
   # Required to obtain backtraces (e.g. when using the "esp-backtrace" crate.)
   # NOTE: May negatively impact performance of produced code
   "-C", "force-frame-pointers",
-#ENDIF
-#IF option("stack-smashing-protection")
+#%endif
+#%if option("stack-smashing-protection")
   "-Z", "stack-protector=all",
-#ENDIF
+#%endif
 ]
 
-#REPLACE riscv32imac-unknown-none-elf rust_target
-target = "riscv32imac-unknown-none-elf"
+target = "{{ rust_target }}"
 
 [unstable]
-#IF option("alloc")
+#%if option("alloc")
 build-std = ["alloc", "core"]
-#ELSE
+#%else
 #+build-std = ["core"]
-#ENDIF
+#%endif

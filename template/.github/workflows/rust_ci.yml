@@ -1,4 +1,4 @@
-#INCLUDEFILE option("ci")
+#%includefile option("ci")
 name: Continuous Integration
 
 on:
@@ -12,9 +12,9 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-#IF is_xtensa
+#%if is_xtensa
   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-#ENDIF
+#%endif
 
 jobs:
   rust-checks:
@@ -34,21 +34,19 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v6
       - name: Setup Rust
-#IF is_riscv
+#%if is_riscv
         uses: dtolnay/rust-toolchain@v1
         with:
-#REPLACE riscv32imac-unknown-none-elf rust_target
-          target: riscv32imac-unknown-none-elf
+          target: {{ rust_target }}
           toolchain: stable
           components: rust-src, rustfmt, clippy
-#ELIF is_xtensa
+#%else if is_xtensa
 #+        uses: esp-rs/xtensa-toolchain@v1.5
 #+        with:
 #+          default: true
-#REPLACE esp32 chip
-#+          buildtargets: esp32
+#+          buildtargets: {{ chip }}
 #+          ldproxy: false
-#ENDIF
+#%endif
       - name: Enable caching
         uses: Swatinem/rust-cache@v2
       - name: Run command

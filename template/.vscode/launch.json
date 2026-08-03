@@ -1,8 +1,8 @@
-//INCLUDEFILE option("vscode")
+//%includefile option("vscode")
 {
     "version": "0.2.0",
     "configurations": [
-        //IF option("probe-rs")
+        //%if option("probe-rs")
         {
             "type": "probe-rs-debug",
             "request": "launch",
@@ -25,14 +25,14 @@
                     //REPLACE riscv32imc-unknown-none-elf rust_target
                     "programBinary": "target/riscv32imc-unknown-none-elf/debug/${workspaceFolderBasename}",
                     "rttEnabled": true,
-                    //IF option("defmt")
+                    //%if option("defmt")
                     "rttChannelFormats": [
                         {
                             "channelNumber": 0,
                             "dataFormat": "Defmt",
                         }
                     ],
-                    //ENDIF
+                    //%endif
                 }
             ]
         },
@@ -49,17 +49,17 @@
                     //REPLACE riscv32imc-unknown-none-elf rust_target
                     "programBinary": "target/riscv32imc-unknown-none-elf/debug/${workspaceFolderBasename}",
                     "rttEnabled": true,
-                    //IF option("defmt")
+                    //%if option("defmt")
                     "rttChannelFormats": [
                         {
                             "channelNumber": 0,
                             "dataFormat": "Defmt",
                         }
                     ],
-                    //ENDIF
+                    //%endif
                 }
             ]
         }
-        //ENDIF
+        //%endif
     ]
 }

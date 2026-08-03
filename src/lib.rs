@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 
 pub mod cargo;
 
-pub use esp_template_sdk::{config, process, template};
+pub use esp_template_sdk::{config, contract, process, template};
 
 /// Build-script-generated `TEMPLATE_FILES` array mapping each file under
 /// `template/` to its baked-in contents. Kept `pub` so xtask (and any other

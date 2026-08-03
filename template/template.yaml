@@ -1,4 +1,4 @@
-#INCLUDEFILE false
+#%includefile false
 required:
   - chip
 options:
@@ -173,7 +173,7 @@ options:
             name: agents
             display_name: AGENTS.md
             sets:
-              coding-agent-guidance-file: AGENTS.md
+              coding_agent_guidance_file: AGENTS.md
             selection_group: coding-agent-guidance
             help: Adds an AGENTS.md file with project-specific guidance and links that coding agents can use while working on this generated project.
 
@@ -181,7 +181,7 @@ options:
             name: claude
             display_name: CLAUDE.md
             sets:
-              coding-agent-guidance-file: CLAUDE.md
+              coding_agent_guidance_file: CLAUDE.md
             selection_group: coding-agent-guidance
             help: Adds a CLAUDE.md file with project-specific guidance and links that Claude can use while working on this generated project.
 
@@ -189,7 +189,7 @@ options:
             name: codex
             display_name: CODEX.md
             sets:
-              coding-agent-guidance-file: CODEX.md
+              coding_agent_guidance_file: CODEX.md
             selection_group: coding-agent-guidance
             help: Adds a CODEX.md file with project-specific guidance and links that Codex can use while working on this generated project.
 
@@ -197,7 +197,7 @@ options:
             name: gemini
             display_name: GEMINI.md
             sets:
-              coding-agent-guidance-file: GEMINI.md
+              coding_agent_guidance_file: GEMINI.md
             selection_group: coding-agent-guidance
             help: Adds a GEMINI.md file with project-specific guidance and links that Gemini can use while working on this generated project.
 
