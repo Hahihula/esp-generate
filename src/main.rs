@@ -822,13 +822,29 @@ fn main() -> Result<()> {
 
     fs::create_dir(&project_dir)?;
 
+    // Resolves `include` paths against the bundled template table. Paths are
+    // template-root-relative, so this is the same key space `TEMPLATE_FILES`
+    // uses and an unknown path simply has no entry.
+    let mut load_partial = |path: &str| -> Result<String, String> {
+        TEMPLATE_FILES
+            .iter()
+            .find_map(|(k, v)| (*k == path).then(|| v.to_string()))
+            .ok_or_else(|| format!("no template file `{path}`"))
+    };
+
     for &(source_path, contents) in TEMPLATE_FILES.iter() {
         let mut out_path = source_path.to_string();
-        let processed =
-            process::process_file(contents, &selected, &selected_groups, &facts, &mut out_path)
-                .map_err(|e| anyhow::anyhow!("{source_path}:{e}"))?;
+        let processed = process::process_file(
+            contents,
+            &selected,
+            &selected_groups,
+            &facts,
+            &mut out_path,
+            &mut load_partial,
+        )
+        .map_err(|e| anyhow::anyhow!("{source_path}:{e}"))?;
         let Some(processed) = processed else {
-            continue; // excluded by #INCLUDEFILE
+            continue; // excluded by `includefile`
         };
 
         // Reject any output path that escapes the project dir, even after

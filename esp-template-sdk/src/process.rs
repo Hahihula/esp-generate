@@ -13,6 +13,13 @@
 //! string and has no notion of a file that should not exist, or of an output
 //! path. They are stripped from the head of the source before compilation.
 //!
+//! The engine's own `include` covers the *content* half: a file that comes in
+//! two variants is one emitted file that includes one of two **partials**,
+//! rather than two files whose `includefile` conditions have to stay exact
+//! negations of each other. A partial carries `includefile false` so it is not
+//! emitted on its own; when included, its head directives are stripped and the
+//! including file decides where the result lands.
+//!
 //! ## Syntax
 //!
 //! Directives are comment-shaped so a template file stays valid, lintable
@@ -31,12 +38,14 @@
 //! parse *every* comment as a directive (`unknown directive keyword 'an'`), so
 //! the marker has to be something that cannot begin an ordinary comment.
 //!
-//! `//+` (`#+`, `--+`) marks a text line: the prefix is stripped and the rest
-//! is emitted, so conditional output can sit behind a comment marker and the
-//! template source still compiles. somni-template has a `text_prefix` for
-//! this, but it drops the line's leading whitespace too — fine for markers at
-//! column 0, wrong for source code — so the SDK strips the prefix itself and
-//! keeps the indentation (see `CommentStyle::strip_text_prefixes`).
+//! `//+` (`#+`, `--+`) is somni-template's `text_prefix`: the leading
+//! whitespace *and* the prefix are dropped, and the rest of the line is
+//! emitted as template text. That lets conditional output sit behind a comment
+//! marker so the template source still compiles.
+//!
+//! Because the leading whitespace goes too, indentation that should survive
+//! into the generated file is written *after* the marker:
+//! `    //+    let p = init();` emits `    let p = init();`.
 //!
 //! ## The fact `Env`
 //!
@@ -260,37 +269,8 @@ impl CommentStyle {
         syntax.block = BlockStyle::Line {
             prefix: self.marker(),
         };
-        // Deliberately NOT `syntax.text_prefix`: see `strip_text_prefixes`.
+        syntax.text_prefix = Some(self.text_prefix());
         syntax
-    }
-
-    /// Uncomment `//+` lines, keeping their indentation.
-    ///
-    /// somni-template has a `text_prefix` feature for exactly this, but it
-    /// drops the leading whitespace along with the prefix — right for
-    /// templates whose markers sit at column 0, wrong for source code, where
-    /// `    //+let p = init();` has to emit `    let p = init();` and not
-    /// shift to column 0.
-    ///
-    /// Only the prefix itself is removed, and only at the start of a line; a
-    /// `//+` occurring later in a line is ordinary content.
-    fn strip_text_prefixes(&self, body: &str) -> String {
-        let prefix = self.text_prefix();
-        let mut out = String::with_capacity(body.len());
-
-        for line in body.split_inclusive('\n') {
-            let indent_len = line.len() - line.trim_start().len();
-            let (indent, rest) = line.split_at(indent_len);
-            match rest.strip_prefix(&prefix) {
-                Some(text) => {
-                    out.push_str(indent);
-                    out.push_str(text);
-                }
-                None => out.push_str(line),
-            }
-        }
-
-        out
     }
 }
 
@@ -526,6 +506,13 @@ fn strip_keyword<'a>(rest: &'a str, keyword: &str) -> Option<&'a str> {
     Some(arg.trim())
 }
 
+/// Resolves an `include` path to that template file's raw contents.
+///
+/// Paths are **template-root-relative** — the same keys the caller stores its
+/// template files under. Returning `Err` turns the include into a compile
+/// error naming the path.
+pub type IncludeLoader<'a> = &'a mut dyn FnMut(&str) -> Result<String, String>;
+
 /// Process a single template file, returning the rendered contents, or `None`
 /// if an `includefile` directive excluded the file entirely.
 ///
@@ -533,6 +520,13 @@ fn strip_keyword<'a>(rest: &'a str, keyword: &str) -> Option<&'a str> {
 /// directive; the rewritten path is validated to stay inside the target
 /// directory. Malformed directives are reported as [`ProcessError`] with the
 /// offending line, never panicked.
+///
+/// `load` resolves `include` directives. An included file is a **partial**: its
+/// body is inlined into the caller and shares the caller's facts, and its own
+/// `includefile` / `include_as` head directives are stripped rather than
+/// obeyed — the including file decides whether and where the result is written.
+/// That is what lets a partial also carry `includefile false`, so it is not
+/// emitted as a file of its own.
 ///
 /// A key absent from [`Facts::values`] is intentionally left unsubstituted by
 /// `include_as` (the literal placeholder survives) — that's the template's
@@ -545,6 +539,7 @@ pub fn process_file(
     selected_groups: &[String], // Selection groups that have a pick
     facts: &Facts,              // Chip-derived facts + substitution values
     file_path: &mut String,     // File path to be modified
+    load: IncludeLoader<'_>,    // Resolves `include` paths
 ) -> Result<Option<String>, ProcessError> {
     // A leading UTF-8 BOM is a file-level encoding marker, not content: editors
     // on Windows add it silently. `str::trim` won't remove it (U+FEFF is not
@@ -588,15 +583,29 @@ pub fn process_file(
         *file_path = renamed;
     }
 
-    // Line-for-line, so reported line numbers are unaffected.
-    let body = style.strip_text_prefixes(&directives.body);
+    let body = directives.body.as_str();
 
-    let template = Template::compile(&body, &syntax)
-        .map_err(|e| template_error(&body, e, directives.consumed, "invalid template directive"))?;
+    // Partials are inlined into this file, so their own head directives are
+    // stripped: `includefile false` on a partial means "not a file of its own",
+    // not "skip this include". The path is checked here as well as by the
+    // loader, so a filesystem-backed loader can't be walked out of its root.
+    let mut load_partial = |path: &str| -> Result<String, String> {
+        if !is_safe_relative_path(path) {
+            return Err(format!(
+                "`{path}` escapes the template root (absolute or `..` paths are not allowed)"
+            ));
+        }
+        let raw = load(path)?;
+        let raw = raw.strip_prefix('\u{feff}').unwrap_or(&raw).to_string();
+        Ok(take_file_directives(&raw, CommentStyle::infer(&raw)).body)
+    };
+
+    let template = Template::compile_with(body, &syntax, &mut load_partial)
+        .map_err(|e| template_error(body, e, directives.consumed, "invalid template directive"))?;
 
     let rendered = template
         .render(build_env(&shared))
-        .map_err(|e| template_error(&body, e, directives.consumed, "render failed"))?;
+        .map_err(|e| template_error(body, e, directives.consumed, "render failed"))?;
 
     // A vocabulary miss outranks whatever the expression evaluated to, since
     // "unknown capability" is the more actionable diagnostic. Rendering may
@@ -661,6 +670,23 @@ fn template_error(
 mod test {
     use super::*;
 
+    /// A loader for the majority of tests, which use no `include` directives.
+    fn no_partials() -> impl FnMut(&str) -> Result<String, String> {
+        |path: &str| Err(format!("this test declares no partial `{path}`"))
+    }
+
+    /// A loader over a fixed `(path, contents)` table.
+    fn partials(
+        files: &'static [(&'static str, &'static str)],
+    ) -> impl FnMut(&str) -> Result<String, String> {
+        move |path: &str| {
+            files
+                .iter()
+                .find_map(|(p, c)| (*p == path).then(|| c.to_string()))
+                .ok_or_else(|| format!("no such partial: {path}"))
+        }
+    }
+
     /// Render with a selected-name list and no chip facts. Expects success.
     fn process(contents: &str, selected: &[&str]) -> Option<String> {
         let selected: Vec<String> = selected.iter().map(|s| s.to_string()).collect();
@@ -670,6 +696,7 @@ mod test {
             &[],
             &Facts::default(),
             &mut String::from("main.rs"),
+            &mut no_partials(),
         )
         .expect("process_file should succeed")
     }
@@ -684,21 +711,36 @@ mod test {
             &groups,
             &Facts::default(),
             &mut String::from("main.rs"),
+            &mut no_partials(),
         )
         .expect("process_file should succeed")
     }
 
     /// Render with facts and no selections.
     fn process_facts(contents: &str, facts: &Facts) -> String {
-        process_file(contents, &[], &[], facts, &mut String::from("m.rs"))
-            .expect("process_file should succeed")
-            .expect("file should be included")
+        process_file(
+            contents,
+            &[],
+            &[],
+            facts,
+            &mut String::from("m.rs"),
+            &mut no_partials(),
+        )
+        .expect("process_file should succeed")
+        .expect("file should be included")
     }
 
     /// Returns the `ProcessError` or panics if the call unexpectedly succeeded.
     fn process_err(contents: &str, facts: &Facts) -> ProcessError {
-        process_file(contents, &[], &[], facts, &mut String::from("f.rs"))
-            .expect_err("expected a ProcessError")
+        process_file(
+            contents,
+            &[],
+            &[],
+            facts,
+            &mut String::from("f.rs"),
+            &mut no_partials(),
+        )
+        .expect_err("expected a ProcessError")
     }
 
     const NESTED: &str = "\
@@ -784,13 +826,19 @@ none
     }
 
     #[test]
-    fn text_prefix_keeps_the_line_indentation() {
-        // The engine's own `text_prefix` drops leading whitespace with the
-        // prefix, which would left-align generated code. Indentation is
-        // semantically meaningful in the files this template emits.
+    fn text_prefix_drops_the_indentation_before_the_marker() {
+        // somni-template's `text_prefix` removes the leading whitespace along
+        // with the prefix. Indentation that must survive into the generated
+        // file therefore goes *after* the marker — worth pinning, because the
+        // difference is invisible until you diff the output.
+        assert_eq!(
+            process("fn main() {\n    //+    let p = init();\n}\n", &[]),
+            Some("fn main() {\n    let p = init();\n}\n".into())
+        );
         assert_eq!(
             process("fn main() {\n    //+let p = init();\n}\n", &[]),
-            Some("fn main() {\n    let p = init();\n}\n".into())
+            Some("fn main() {\nlet p = init();\n}\n".into()),
+            "indentation before the marker is not preserved"
         );
     }
 
@@ -824,11 +872,85 @@ none
             &[],
             &facts,
             &mut path,
+            &mut no_partials(),
         )
         .unwrap()
         .unwrap();
         assert_eq!(path, "src/esp32c6.rs");
         assert_eq!(res, "fn main() {}\n");
+    }
+
+    /// The variant-pair pattern: one emitted file picks one of two partials,
+    /// so the choice is structurally exclusive instead of relying on two
+    /// conditions staying exact negations of each other.
+    #[test]
+    fn a_conditional_include_picks_one_partial() {
+        const FILES: &[(&str, &str)] = &[
+            // Partials carry `includefile false` so they are not emitted on
+            // their own; that head directive must not leak into the caller.
+            (
+                "src/bin/main_async.rs",
+                "//%includefile false\nasync on {{ chip }}\n",
+            ),
+            (
+                "src/bin/main_blocking.rs",
+                "//%includefile false\nblocking\n",
+            ),
+        ];
+        let src = "\
+//%if option(\"embassy\")
+//%include \"src/bin/main_async.rs\"
+//%else
+//%include \"src/bin/main_blocking.rs\"
+//%endif
+";
+        let mut facts = Facts::default();
+        facts.set_value("chip", "esp32c6");
+
+        let render = |selected: &[&str]| {
+            let selected: Vec<String> = selected.iter().map(|s| s.to_string()).collect();
+            process_file(
+                src,
+                &selected,
+                &[],
+                &facts,
+                &mut String::from("src/bin/main.rs"),
+                &mut partials(FILES),
+            )
+            .unwrap()
+            .unwrap()
+        };
+
+        assert_eq!(render(&["embassy"]), "async on esp32c6\n");
+        assert_eq!(render(&[]), "blocking\n");
+    }
+
+    #[test]
+    fn an_include_cannot_escape_the_template_root() {
+        let err = process_file(
+            "//%include \"../../etc/passwd\"\n",
+            &[],
+            &[],
+            &Facts::default(),
+            &mut String::from("m.rs"),
+            &mut partials(&[]),
+        )
+        .expect_err("escaping include must be rejected");
+        assert!(err.message.contains("escapes the template root"), "{err}");
+    }
+
+    #[test]
+    fn a_missing_partial_is_a_hard_error() {
+        let err = process_file(
+            "//%include \"nope.rs\"\n",
+            &[],
+            &[],
+            &Facts::default(),
+            &mut String::from("m.rs"),
+            &mut partials(&[]),
+        )
+        .expect_err("a missing partial must not render as empty");
+        assert!(err.message.contains("nope.rs"), "{err}");
     }
 
     #[test]
@@ -995,8 +1117,15 @@ big-dram2
 
         // A contained path with an interior `.` is fine.
         let mut path = String::from("orig.rs");
-        process_file("#%include_as ./src/a.rs\nx\n", &[], &[], &facts, &mut path)
-            .expect("contained path is allowed");
+        process_file(
+            "#%include_as ./src/a.rs\nx\n",
+            &[],
+            &[],
+            &facts,
+            &mut path,
+            &mut no_partials(),
+        )
+        .expect("contained path is allowed");
         assert_eq!(path, "./src/a.rs");
     }
 
@@ -1029,6 +1158,7 @@ big-dram2
                 &[],
                 &facts,
                 &mut path,
+                &mut no_partials(),
             )
             .unwrap();
             // `{outer}` expands once; its `{inner}` is output, not re-expanded.
@@ -1048,6 +1178,7 @@ big-dram2
             &[],
             &facts,
             &mut path,
+            &mut no_partials(),
         )
         .unwrap();
         assert_eq!(path, "src/esp32c6/{nope}/{unclosed.rs");
@@ -1147,6 +1278,7 @@ big-dram2
             &[],
             &facts,
             &mut String::from("m.rs"),
+            &mut no_partials(),
         )
         .unwrap()
         .unwrap();
@@ -1174,6 +1306,7 @@ big-dram2
             &[],
             &facts,
             &mut path,
+            &mut no_partials(),
         )
         .unwrap();
         assert_eq!(path, "src/日本esp32c6語/🦀.rs");
@@ -1199,6 +1332,7 @@ big-dram2
             &[],
             &Facts::default(),
             &mut String::from("m.rs"),
+            &mut no_partials(),
         )
         .unwrap();
         assert_eq!(out, None, "BOM hid the `includefile`");
@@ -1320,6 +1454,7 @@ big-dram2
             &[],
             &facts,
             &mut path,
+            &mut no_partials(),
         )
         .unwrap();
         assert_eq!(path, "CLAUDE.md");

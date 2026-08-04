@@ -1,5 +1,4 @@
-//%includefile option("embassy") && option("embedded-test")
-//%include_as tests/hello_test.rs
+//%includefile false
 //! Demo test suite using embedded-test
 //!
 //! You can run this using `cargo test` as usual.

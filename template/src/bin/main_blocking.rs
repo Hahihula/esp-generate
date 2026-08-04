@@ -1,5 +1,4 @@
-//%includefile option("embassy")
-//%include_as src/bin/main.rs
+//%includefile false
 #![no_std]
 #![no_main]
 #![deny(
@@ -9,20 +8,11 @@
 )]
 #![deny(clippy::large_stack_frames)]
 
-use esp_hal::clock::CpuClock;
-use esp_hal::timer::timg::TimerGroup;
-
-//%if option("ble-trouble")
-use esp_radio::ble::controller::BleConnector;
-//%endif
-//%if option("ble-trouble")
-use bt_hci::controller::ExternalController;
-use trouble_host::prelude::*;
-//%endif
-
-use embassy_executor::Spawner;
-use embassy_time::{Duration, Timer};
-
+use esp_hal::{
+    clock::CpuClock,
+    main,
+    time::{Duration, Instant},
+};
 //%if option("defmt")
 //%if !option("probe-rs")
 //+use esp_println as _;
@@ -69,11 +59,6 @@ fn panic(_: &core::panic::PanicInfo) -> ! {
 extern crate alloc;
 //%endif
 
-//%if option("ble-trouble")
-const CONNECTIONS_MAX: usize = 1;
-const L2CAP_CHANNELS_MAX: usize = 1;
-//%endif
-
 // This creates a default app-descriptor required by the esp-idf bootloader.
 // For more information see: <https://docs.espressif.com/projects/esp-idf/en/stable/esp32/api-reference/system/app_image_format.html#application-description>
 esp_bootloader_esp_idf::esp_app_desc!();
@@ -82,8 +67,8 @@ esp_bootloader_esp_idf::esp_app_desc!();
     clippy::large_stack_frames,
     reason = "it's not unusual to allocate larger buffers etc. in main"
 )]
-#[esp_rtos::main]
-async fn main(spawner: Spawner) -> ! {
+#[main]
+fn main() -> ! {
     // generator version: {{ generate_version }}
     // generator parameters: {{ generate_parameters }}
 
@@ -98,45 +83,17 @@ async fn main(spawner: Spawner) -> ! {
     //%endif
 
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
+    //%if has_reserved_pins
     let peripherals = esp_hal::init(config);
+    //%else
+    //+    let _peripherals = esp_hal::init(config);
+    //%endif
 
     {{ reserved_gpio_code }}
 
     //%if option("alloc")
     esp_alloc::heap_allocator!(#[esp_hal::ram(reclaimed)] size: {{ str(dram2_uninit_size) }});
-    //%if option("wifi") && option("ble-trouble")
-    // COEX needs more RAM - so we've added some more
-    esp_alloc::heap_allocator!(size: 64 * 1024);
-    //%endif
     //%endif alloc
-
-    let timg0 = TimerGroup::new(peripherals.TIMG0);
-    let sw_interrupt =
-        esp_hal::interrupt::software::SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
-    esp_rtos::start(timg0.timer0, sw_interrupt.software_interrupt0);
-
-    //%if option("defmt") || option("log")
-    info!("Embassy initialized!");
-    //%else if option("probe-rs")
-    rprintln!("Embassy initialized!");
-    //%endif
-
-    //%if option("wifi")
-    let (mut _wifi_controller, _interfaces) =
-        esp_radio::wifi::new(peripherals.WIFI, Default::default())
-            .expect("Failed to initialize Wi-Fi controller");
-    //%endif
-    //%if option("ble-trouble")
-    // find more examples https://github.com/embassy-rs/trouble/tree/main/examples/esp32
-    let transport = BleConnector::new(peripherals.BT, Default::default()).unwrap();
-    let ble_controller = ExternalController::<_, 1>::new(transport);
-    let mut resources: HostResources<DefaultPacketPool, CONNECTIONS_MAX, L2CAP_CHANNELS_MAX> =
-        HostResources::new();
-    let _stack = trouble_host::new(ble_controller, &mut resources);
-    //%endif
-
-    // TODO: Spawn some tasks
-    let _ = spawner;
 
     loop {
         //%if option("defmt") || option("log")
@@ -144,7 +101,8 @@ async fn main(spawner: Spawner) -> ! {
         //%else if option("probe-rs")
         rprintln!("Hello world!");
         //%endif
-        Timer::after(Duration::from_secs(1)).await;
+        let delay_start = Instant::now();
+        while delay_start.elapsed() < Duration::from_millis(500) {}
     }
 
     // for inspiration have a look at the examples at https://github.com/esp-rs/esp-hal/tree/esp-hal-v{{ esp_hal_version_full }}/examples
