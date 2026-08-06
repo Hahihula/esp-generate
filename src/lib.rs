@@ -1,9 +1,14 @@
+use std::collections::{BTreeSet, HashMap, HashSet};
+
 use esp_metadata_generated::{MemoryRegion, PinInfo};
+use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
+use strum::IntoEnumIterator;
 
 pub mod cargo;
-pub mod config;
-pub mod template;
+
+pub use esp_template_sdk::{config, contract, process, template};
+
 /// Build-script-generated `TEMPLATE_FILES` array mapping each file under
 /// `template/` to its baked-in contents. Kept `pub` so xtask (and any other
 /// consumer that needs to resolve `!Include` paths against the bundled
@@ -62,6 +67,86 @@ impl Chip {
     pub fn pins(self) -> &'static [PinInfo] {
         self.metadata().pins()
     }
+
+    /// The chip-derived half of [`process::Facts`]: everything that depends on
+    /// which chip is selected and on nothing else.
+    ///
+    /// These facts have to be live during *configuration*, not just during
+    /// generation: [`config::ActiveConfiguration`] gates `requires_capabilities`
+    /// on them, and treats absent facts as unconstrained. Generation layers the
+    /// selection- and project-scoped values on top of the same base, so the
+    /// capability set the option tree was filtered by is by construction the
+    /// one `chip.…` later sees.
+    pub fn facts(self) -> process::Facts {
+        process::Facts {
+            chip: Some(self.chip_fields()),
+            ..Default::default()
+        }
+    }
+
+    /// The `chip` struct a template sees: `chip.name`, `chip.rust_target`,
+    /// `chip.dram2_uninit_size`, and one field per `esp-metadata` symbol.
+    ///
+    /// The symbol fields are the **union over every chip**, not just this
+    /// chip's. somni reports an unknown struct field as an error, which is the
+    /// diagnostic we want for a typo — but it means a capability this chip
+    /// merely lacks must still be *present* and `false`, or a portable
+    /// `#%if chip.soc_has_wifi` would fail on an ESP32-H2 instead of taking its
+    /// else branch.
+    fn chip_fields(self) -> IndexMap<String, process::FactValue> {
+        // A symbol is either a bare flag (`riscv`) or a `name="value"` pair
+        // (`bt_controller="npl"`). Classify by name across *all* chips so a
+        // field's type doesn't change with the selection: a valued symbol is
+        // always a string, empty when this chip doesn't declare it.
+        let mut valued: HashSet<&'static str> = HashSet::new();
+        let mut every_symbol: BTreeSet<&'static str> = BTreeSet::new();
+        for chip in Chip::iter() {
+            for symbol in chip.metadata().all_symbols() {
+                match symbol.split_once('=') {
+                    Some((name, _)) => {
+                        valued.insert(name);
+                        every_symbol.insert(name);
+                    }
+                    None => {
+                        every_symbol.insert(symbol);
+                    }
+                }
+            }
+        }
+
+        // What *this* chip declares, indexed the same way.
+        let metadata = self.metadata();
+        let mut mine: HashMap<&str, Option<&str>> = HashMap::new();
+        for symbol in metadata.all_symbols() {
+            match symbol.split_once('=') {
+                Some((name, value)) => {
+                    mine.insert(name, Some(value.trim_matches('"')));
+                }
+                None => {
+                    mine.insert(symbol, None);
+                }
+            }
+        }
+
+        let mut fields = IndexMap::new();
+        fields.insert("name".to_string(), self.to_string().into());
+        fields.insert("rust_target".to_string(), metadata.target().into());
+        fields.insert(
+            "dram2_uninit_size".to_string(),
+            self.dram2_region().size().into(),
+        );
+
+        for symbol in every_symbol {
+            let value: process::FactValue = if valued.contains(symbol) {
+                mine.get(symbol).and_then(|v| *v).unwrap_or("").into()
+            } else {
+                mine.contains_key(symbol).into()
+            };
+            fields.insert(symbol.to_string(), value);
+        }
+
+        fields
+    }
 }
 
 /// This turns a list of strings into a sentence, and appends it to the base string.
@@ -108,5 +193,101 @@ pub fn append_list_as_sentence<S: AsRef<str>>(base: &str, word: &str, els: &[S])
         requires
     } else {
         base.to_string()
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use strum::IntoEnumIterator;
+
+    use super::*;
+
+    fn fields(chip: Chip) -> IndexMap<String, process::FactValue> {
+        chip.facts().chip.expect("a chip always has chip facts")
+    }
+
+    /// The capability gate is only as good as the field values handed to it, so
+    /// a chip-independent set would silently pass everything.
+    #[test]
+    fn chip_fields_are_chip_specific() {
+        let c6 = fields(Chip::Esp32c6);
+        let h2 = fields(Chip::Esp32h2);
+
+        assert_eq!(
+            c6.get("soc_has_wifi"),
+            Some(&process::FactValue::Bool(true))
+        );
+        assert_eq!(
+            h2.get("soc_has_wifi"),
+            Some(&process::FactValue::Bool(false)),
+            "ESP32-H2 has no Wi-Fi"
+        );
+    }
+
+    /// The whole point of the union: a capability the chip *lacks* must still
+    /// be a field, or a portable `#%if chip.soc_has_wifi` would be an
+    /// unknown-field error on an ESP32-H2 instead of taking its else branch.
+    /// Only a genuine typo may be absent.
+    #[test]
+    fn every_chip_carries_every_chips_symbols() {
+        let all: BTreeSet<String> = Chip::iter().flat_map(|c| fields(c).into_keys()).collect();
+
+        for chip in Chip::iter() {
+            let mine = fields(chip);
+            for symbol in &all {
+                assert!(
+                    mine.contains_key(symbol),
+                    "{chip} is missing the field `{symbol}`"
+                );
+            }
+            assert!(
+                !mine.contains_key("soc_has_wfi"),
+                "a misspelling must stay absent, so somni can report it"
+            );
+        }
+    }
+
+    #[test]
+    fn chip_fields_cover_the_isa_and_the_scalars() {
+        for chip in Chip::iter() {
+            let f = fields(chip);
+
+            assert_eq!(
+                f.get("name"),
+                Some(&process::FactValue::Str(chip.to_string())),
+                "{chip} must name itself"
+            );
+            for key in ["rust_target", "dram2_uninit_size"] {
+                assert!(f.contains_key(key), "{chip} is missing `{key}`");
+            }
+
+            // `xtensa` / `riscv` are ordinary metadata symbols, which is why
+            // the purpose-picked `is_xtensa` / `is_riscv` facts could go.
+            let xtensa = f.get("xtensa") == Some(&process::FactValue::Bool(true));
+            let riscv = f.get("riscv") == Some(&process::FactValue::Bool(true));
+            assert_ne!(
+                xtensa, riscv,
+                "{chip} must be exactly one of Xtensa or RISC-V"
+            );
+            assert_eq!(xtensa, chip.metadata().is_xtensa());
+        }
+    }
+
+    /// Some symbols are `name="value"` pairs. Their type must not change with
+    /// the selected chip, or a comparison that works on one chip becomes a type
+    /// error on another.
+    #[test]
+    fn valued_symbols_stay_strings_on_every_chip() {
+        for chip in Chip::iter() {
+            let f = fields(chip);
+            assert!(
+                matches!(f.get("bt_controller"), Some(process::FactValue::Str(_))),
+                "{chip} must expose `bt_controller` as a string"
+            );
+            // The value is unquoted, not the raw `bt_controller="npl"` symbol.
+            if let Some(process::FactValue::Str(v)) = f.get("bt_controller") {
+                assert!(!v.contains('"'), "{chip} left quotes in `{v}`");
+            }
+        }
     }
 }

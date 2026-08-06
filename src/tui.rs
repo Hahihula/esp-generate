@@ -7,6 +7,7 @@ use env_logger::{Builder, Env, Logger};
 use esp_generate::{
     append_list_as_sentence,
     config::{ActiveConfiguration, Relationships, flatten_options},
+    process::Facts,
     template::GeneratorOptionItem,
 };
 use log::{Level, LevelFilter, Log, Metadata, Record, SetLoggerError};
@@ -42,7 +43,11 @@ pub struct Repository {
 }
 
 impl Repository {
-    pub fn new(options: Vec<GeneratorOptionItem>, selected: &[String]) -> Self {
+    pub fn new(
+        options: Vec<GeneratorOptionItem>,
+        selected: &[String],
+        facts: Option<Facts>,
+    ) -> Self {
         let flat_options = flatten_options(&options);
         Self {
             config: ActiveConfiguration {
@@ -52,6 +57,7 @@ impl Repository {
                     .collect(),
                 flat_options,
                 options,
+                facts,
             },
             path: Vec::new(),
         }
@@ -374,6 +380,14 @@ impl Repository {
 }
 
 pub fn init_terminal() -> Result<Terminal<CrosstermBackend<io::Stdout>>> {
+    // Restore the terminal on panic so a panic from the IO-free SDK
+    // doesn't leave the terminal in raw/alternate-screen mode.
+    let previous_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        ratatui::restore();
+        previous_hook(info);
+    }));
+
     enable_raw_mode()?;
     io::stdout().execute(EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(io::stdout());
@@ -641,6 +655,7 @@ mod test {
             requires: requires.iter().map(|r| r.to_string()).collect(),
             compatible: IndexMap::new(),
             sets: IndexMap::new(),
+            ..Default::default()
         })
     }
 
@@ -662,6 +677,7 @@ mod test {
             requires: requires.iter().map(|r| r.to_string()).collect(),
             compatible,
             sets: IndexMap::new(),
+            ..Default::default()
         })
     }
 
@@ -676,6 +692,7 @@ mod test {
             requires: Vec::new(),
             compatible: IndexMap::new(),
             sets: IndexMap::new(),
+            ..Default::default()
         })
     }
 
@@ -705,7 +722,7 @@ mod test {
             chip_group_option(Chip::Esp32c6),
             option("alloc", &[]),
         ];
-        let repository = Repository::new(options, &["alloc".to_string()]);
+        let repository = Repository::new(options, &["alloc".to_string()], None);
         let mut app = app_with(&["chip"], repository);
 
         assert!(
@@ -726,7 +743,7 @@ mod test {
         // No `required` entries → Save is never gated, regardless of
         // selection state. This is the fallback for templates that don't
         // opt into the mechanism.
-        let repository = Repository::new(vec![option("alloc", &[])], &[]);
+        let repository = Repository::new(vec![option("alloc", &[])], &[], None);
         let app = app_with(&[], repository);
         assert!(app.can_save());
         assert!(app.missing_required_groups().is_empty());
@@ -752,6 +769,7 @@ mod test {
                 "method-unselected-b".to_string(),
                 "defmt".to_string(),
             ],
+            None,
         );
 
         repository.toggle_current(0);
@@ -787,6 +805,7 @@ mod test {
         let repository = Repository::new(
             options,
             &["method".to_string(), "dependent".to_string()],
+            None,
         );
 
         let ui = plain_ui();
@@ -862,7 +881,7 @@ mod test {
             option("method", &[]),
             option("unmet-pos", &["needs-x", "!method"]),
         ];
-        let repository = Repository::new(options, &["method".to_string()]);
+        let repository = Repository::new(options, &["method".to_string()], None);
 
         let (actionable, line) = repository
             .current_level_desc(80, &ui, Some(1))
@@ -899,12 +918,11 @@ mod test {
                 requires: vec!["!method".to_string()],
                 compatible: wrong_chip_compat,
                 sets: IndexMap::new(),
+                ..Default::default()
             }),
         ];
-        let repository = Repository::new(
-            options,
-            &["esp32".to_string(), "method".to_string()],
-        );
+        let repository =
+            Repository::new(options, &["esp32".to_string(), "method".to_string()], None);
         let rows = repository.current_level_desc(80, &ui, Some(0));
         assert!(
             rows.iter()
@@ -944,6 +962,7 @@ mod test {
                 "loooooong-two".to_string(),
                 "loooooong-three".to_string(),
             ],
+            None,
         );
 
         let ui = plain_ui();
@@ -1005,6 +1024,7 @@ mod test {
                 "will-vanish".to_string(),
                 "dependent".to_string(),
             ],
+            None,
         );
         // Simulate the user having entered the `cat` category.
         repository.enter_group(0);
@@ -1053,7 +1073,7 @@ mod test {
             chip_group_option(Chip::Esp32),
             chip_group_option(Chip::Esp32c6),
         ];
-        let mut repository = Repository::new(options, &["esp32".to_string()]);
+        let mut repository = Repository::new(options, &["esp32".to_string()], None);
 
         repository.toggle_current(0);
         assert!(
@@ -1103,6 +1123,7 @@ mod test {
                 "alloc".to_string(),
                 "depends-on-wroom".to_string(),
             ],
+            None,
         );
 
         // Look up the esp32c6 chip-group option as a plain `GeneratorOption`
@@ -1168,6 +1189,7 @@ mod test {
                 "only-on-esp32".to_string(),
                 "shared".to_string(),
             ],
+            None,
         );
 
         // Rebuild for the new chip as if `build_options({chip: "esp32c6"}, …)`

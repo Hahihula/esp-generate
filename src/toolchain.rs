@@ -206,7 +206,7 @@ pub fn toolchains_for_chip(
     let mut names: Vec<String> = all
         .iter()
         .filter(|tc| tc.targets.contains(target.as_str()))
-        .filter(|tc| tc.version.as_ref().is_none_or(|v| v.is_at_least(msrv)))
+        .filter(|tc| tc.version.as_ref().is_none_or(|v| v >= msrv))
         .map(|tc| tc.name.clone())
         .collect();
 

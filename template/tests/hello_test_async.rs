@@ -1,5 +1,4 @@
-//INCLUDEFILE option("embassy") && option("embedded-test")
-//INCLUDE_AS tests/hello_test.rs
+//%includefile false
 //! Demo test suite using embedded-test
 //!
 //! You can run this using `cargo test` as usual.
@@ -12,9 +11,9 @@ esp_bootloader_esp_idf::esp_app_desc!();
 #[cfg(test)]
 #[embedded_test::tests(executor = esp_rtos::embassy::Executor::new())]
 mod tests {
-    //IF option("defmt")
+    //%if option("defmt")
     use defmt::assert_eq;
-    //ENDIF
+    //%endif
 
     #[init]
     fn init() {
@@ -25,16 +24,16 @@ mod tests {
             esp_hal::interrupt::software::SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
         esp_rtos::start(timg0.timer0, sw_interrupt.software_interrupt0);
 
-        //IF option("defmt")
+        //%if option("defmt")
         rtt_target::rtt_init_defmt!();
-        //ENDIF
+        //%endif
     }
 
     #[test]
     async fn hello_test() {
-        //IF option("defmt")
+        //%if option("defmt")
         defmt::info!("Running test!");
-        //ENDIF
+        //%endif
 
         embassy_time::Timer::after(embassy_time::Duration::from_millis(100)).await;
         assert_eq!(1 + 1, 2);

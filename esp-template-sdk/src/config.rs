@@ -1,6 +1,20 @@
 use std::collections::HashMap;
 
+use crate::process::{FactValue, Facts};
 use crate::template::{GeneratorOption, GeneratorOptionItem};
+
+/// Whether a chip field counts as "has this capability".
+///
+/// Boolean symbols say so directly; a string-valued symbol
+/// (`bt_controller = "npl"`) counts as present unless it is empty, which is how
+/// a chip that lacks it entirely is represented.
+fn is_truthy(value: &FactValue) -> bool {
+    match value {
+        FactValue::Bool(b) => *b,
+        FactValue::Str(s) => !s.is_empty(),
+        FactValue::Int(i) => *i != 0,
+    }
+}
 
 #[derive(Debug)]
 pub struct ActiveConfiguration {
@@ -10,6 +24,9 @@ pub struct ActiveConfiguration {
     pub options: Vec<GeneratorOptionItem>,
     /// All available option items (categories are not included), flattened to avoid the need for recursion.
     pub flat_options: Vec<GeneratorOption>,
+    /// Chip-derived facts for capability gating. `None` means unconstrained —
+    /// `requires_capabilities` is not enforced until a chip is picked.
+    pub facts: Option<Facts>,
 }
 
 pub fn flatten_options(options: &[GeneratorOptionItem]) -> Vec<GeneratorOption> {
@@ -65,11 +82,18 @@ impl ActiveConfiguration {
     ///     option that survived by name but depended on something the chip
     ///     switch eliminated).
     ///
-    /// Note: `path` on [`crate::tui::Repository`] is a UI concern and is NOT
-    /// touched here.
+    /// Note: `path` on the binary's TUI `Repository` is a UI concern and is
+    /// NOT touched here.
     pub fn reset_options(&mut self, options: Vec<GeneratorOptionItem>) {
         self.options = options;
         self.rebuild_indices();
+        self.drop_unsatisfied();
+    }
+
+    /// Swap in chip-derived [`Facts`] and re-evaluate capability gating.
+    /// Any selected option whose capabilities the new chip lacks is cascaded out.
+    pub fn set_facts(&mut self, facts: Option<Facts>) {
+        self.facts = facts;
         self.drop_unsatisfied();
     }
 
@@ -240,6 +264,7 @@ impl ActiveConfiguration {
                         opt,
                         &self.selected,
                         &self.flat_options,
+                        self.facts.as_ref(),
                     )
             });
             match victim {
@@ -327,7 +352,12 @@ impl ActiveConfiguration {
             let victim = simulated.iter().position(|&idx| {
                 let opt = &self.flat_options[idx];
                 !Self::requirements_met_against(opt, &simulated, &self.flat_options)
-                    || !Self::is_option_compatible_against(opt, &simulated, &self.flat_options)
+                    || !Self::is_option_compatible_against(
+                        opt,
+                        &simulated,
+                        &self.flat_options,
+                        self.facts.as_ref(),
+                    )
             });
             match victim {
                 Some(pos) => {
@@ -452,16 +482,26 @@ impl ActiveConfiguration {
     /// "I only apply to these chips", driven by the current selection in the
     /// `chip` selection group.
     pub fn is_option_compatible(&self, option: &GeneratorOption) -> bool {
-        Self::is_option_compatible_against(option, &self.selected, &self.flat_options)
+        Self::is_option_compatible_against(
+            option,
+            &self.selected,
+            &self.flat_options,
+            self.facts.as_ref(),
+        )
     }
 
-    /// Static variant of [`Self::is_option_compatible`] that evaluates against
-    /// an arbitrary selection set. Used by [`Self::would_force_deselect`] to
-    /// simulate the effect of a toggle without mutating `self`.
+    /// Static variant of [`Self::is_option_compatible`] for evaluating against
+    /// an arbitrary selection set (used by [`Self::would_force_deselect`]).
+    ///
+    /// Two independent gates must hold: `compatible: { group: [...] }` allow-lists,
+    /// and every `requires_capabilities` entry being a chip field that is true.
+    /// With `facts = None` — or no chip picked — the capability gate is
+    /// unconstrained.
     fn is_option_compatible_against(
         option: &GeneratorOption,
         selected: &[usize],
         flat_options: &[GeneratorOption],
+        facts: Option<&Facts>,
     ) -> bool {
         for (group, allowed) in &option.compatible {
             let group_ok = selected.iter().any(|&idx| {
@@ -472,6 +512,19 @@ impl ActiveConfiguration {
                 return false;
             }
         }
+
+        if let Some(chip) = facts.and_then(|f| f.chip.as_ref()) {
+            for cap in &option.requires_capabilities {
+                // The chip carries a field for every symbol any chip declares,
+                // so an absent name is an unknown capability and a present-but-
+                // false one is a capability this chip lacks. Both fail the gate;
+                // `check` is what tells the author which of the two it was.
+                if !chip.get(cap).is_some_and(is_truthy) {
+                    return false;
+                }
+            }
+        }
+
         true
     }
 
@@ -500,7 +553,6 @@ impl ActiveConfiguration {
 
         for selected in self.selected.iter().copied() {
             let Some(selected_option) = self.flat_options.get(selected) else {
-                ratatui::restore();
                 panic!("selected option not found: {selected}");
             };
 
@@ -658,6 +710,9 @@ mod test {
                 compatible: IndexMap::new(),
                 sets: IndexMap::new(),
                 requires: vec!["option2".to_string()],
+                requires_capabilities: vec![],
+                requires_tools: vec![],
+                requires_nightly: false,
             }),
             GeneratorOptionItem::Option(GeneratorOption {
                 name: "option2".to_string(),
@@ -667,12 +722,16 @@ mod test {
                 compatible: IndexMap::new(),
                 sets: IndexMap::new(),
                 requires: vec![],
+                requires_capabilities: vec![],
+                requires_tools: vec![],
+                requires_nightly: false,
             }),
         ];
         let active = ActiveConfiguration {
             selected: vec![0],
             flat_options: flatten_options(&options),
             options,
+            facts: None,
         };
 
         let rels = active.collect_relationships(&active.options[0]);
@@ -695,6 +754,9 @@ mod test {
                 compatible: IndexMap::new(),
                 sets: IndexMap::new(),
                 requires: vec![],
+                requires_capabilities: vec![],
+                requires_tools: vec![],
+                requires_nightly: false,
             }),
             GeneratorOptionItem::Option(GeneratorOption {
                 name: "option2".to_string(),
@@ -704,6 +766,9 @@ mod test {
                 compatible: IndexMap::new(),
                 sets: IndexMap::new(),
                 requires: vec![],
+                requires_capabilities: vec![],
+                requires_tools: vec![],
+                requires_nightly: false,
             }),
             GeneratorOptionItem::Option(GeneratorOption {
                 name: "option3".to_string(),
@@ -713,12 +778,16 @@ mod test {
                 compatible: IndexMap::new(),
                 sets: IndexMap::new(),
                 requires: vec!["option2".to_string()],
+                requires_capabilities: vec![],
+                requires_tools: vec![],
+                requires_nightly: false,
             }),
         ];
         let mut active = ActiveConfiguration {
             selected: vec![],
             flat_options: flatten_options(&options),
             options,
+            facts: None,
         };
 
         active.select("option1");
@@ -752,6 +821,9 @@ mod test {
                         compatible: IndexMap::new(),
                         sets: IndexMap::new(),
                         requires: vec![],
+                        requires_capabilities: vec![],
+                        requires_tools: vec![],
+                        requires_nightly: false,
                     }),
                     GeneratorOptionItem::Option(GeneratorOption {
                         name: "option2".to_string(),
@@ -761,6 +833,9 @@ mod test {
                         compatible: IndexMap::new(),
                         sets: IndexMap::new(),
                         requires: vec![],
+                        requires_capabilities: vec![],
+                        requires_tools: vec![],
+                        requires_nightly: false,
                     }),
                 ],
             }),
@@ -772,6 +847,9 @@ mod test {
                 compatible: IndexMap::new(),
                 sets: IndexMap::new(),
                 requires: vec!["group".to_string()],
+                requires_capabilities: vec![],
+                requires_tools: vec![],
+                requires_nightly: false,
             }),
             GeneratorOptionItem::Option(GeneratorOption {
                 name: "option4".to_string(),
@@ -781,12 +859,16 @@ mod test {
                 compatible: IndexMap::new(),
                 sets: IndexMap::new(),
                 requires: vec!["option3".to_string()],
+                requires_capabilities: vec![],
+                requires_tools: vec![],
+                requires_nightly: false,
             }),
         ];
         let mut active = ActiveConfiguration {
             selected: vec![],
             flat_options: flatten_options(&options),
             options,
+            facts: None,
         };
 
         // Nothing is selected in group, so option3 can't be selected
@@ -820,6 +902,9 @@ mod test {
                 compatible: IndexMap::new(),
                 sets: IndexMap::new(),
                 requires: vec![],
+                requires_capabilities: vec![],
+                requires_tools: vec![],
+                requires_nightly: false,
             }),
             GeneratorOptionItem::Option(GeneratorOption {
                 name: "option2".to_string(),
@@ -829,12 +914,16 @@ mod test {
                 compatible: IndexMap::new(),
                 sets: IndexMap::new(),
                 requires: vec!["group".to_string()],
+                requires_capabilities: vec![],
+                requires_tools: vec![],
+                requires_nightly: false,
             }),
         ];
         let mut active = ActiveConfiguration {
             selected: vec![],
             flat_options: flatten_options(&options),
             options,
+            facts: None,
         };
 
         active.select("option1");
@@ -858,6 +947,9 @@ mod test {
                 compatible: IndexMap::new(),
                 sets: IndexMap::new(),
                 requires: vec![],
+                requires_capabilities: vec![],
+                requires_tools: vec![],
+                requires_nightly: false,
             }),
             GeneratorOptionItem::Option(GeneratorOption {
                 name: "option2".to_string(),
@@ -867,12 +959,16 @@ mod test {
                 compatible: IndexMap::new(),
                 sets: IndexMap::new(),
                 requires: vec!["!option1".to_string()],
+                requires_capabilities: vec![],
+                requires_tools: vec![],
+                requires_nightly: false,
             }),
         ];
         let mut active = ActiveConfiguration {
             selected: vec![],
             flat_options: flatten_options(&options),
             options,
+            facts: None,
         };
 
         active.select("option1");
@@ -908,6 +1004,9 @@ mod test {
                 compatible: IndexMap::new(),
                 sets: IndexMap::new(),
                 requires: vec![],
+                requires_capabilities: vec![],
+                requires_tools: vec![],
+                requires_nightly: false,
             }),
             GeneratorOptionItem::Option(GeneratorOption {
                 name: "log".to_string(),
@@ -917,6 +1016,9 @@ mod test {
                 compatible: IndexMap::new(),
                 sets: IndexMap::new(),
                 requires: vec!["!probe-rs".to_string()],
+                requires_capabilities: vec![],
+                requires_tools: vec![],
+                requires_nightly: false,
             }),
             GeneratorOptionItem::Option(GeneratorOption {
                 name: "embedded-test".to_string(),
@@ -926,6 +1028,9 @@ mod test {
                 compatible: IndexMap::new(),
                 sets: IndexMap::new(),
                 requires: vec!["log".to_string()],
+                requires_capabilities: vec![],
+                requires_tools: vec![],
+                requires_nightly: false,
             }),
             GeneratorOptionItem::Option(GeneratorOption {
                 name: "panic-rtt-target".to_string(),
@@ -935,6 +1040,9 @@ mod test {
                 compatible: IndexMap::new(),
                 sets: IndexMap::new(),
                 requires: vec!["probe-rs".to_string()],
+                requires_capabilities: vec![],
+                requires_tools: vec![],
+                requires_nightly: false,
             }),
             GeneratorOptionItem::Option(GeneratorOption {
                 name: "wifi".to_string(),
@@ -944,12 +1052,16 @@ mod test {
                 compatible: IndexMap::new(),
                 sets: IndexMap::new(),
                 requires: vec![],
+                requires_capabilities: vec![],
+                requires_tools: vec![],
+                requires_nightly: false,
             }),
         ];
         let mut active = ActiveConfiguration {
             selected: vec![],
             flat_options: flatten_options(&options),
             options,
+            facts: None,
         };
 
         active.select("log");
@@ -983,8 +1095,7 @@ mod test {
         assert!(!evicted.contains(&"probe-rs".to_string())); // never itself
         assert!(!evicted.contains(&"wifi".to_string())); // unrelated stays
 
-        let (probe_rs_flat_idx, _) =
-            find_option("probe-rs", &active.flat_options).unwrap();
+        let (probe_rs_flat_idx, _) = find_option("probe-rs", &active.flat_options).unwrap();
         active.deselect_idx(probe_rs_flat_idx);
         assert!(!active.is_selected("probe-rs"));
         assert!(!active.is_selected("panic-rtt-target"));
@@ -1019,6 +1130,9 @@ mod test {
                 compatible: IndexMap::new(),
                 sets: IndexMap::new(),
                 requires: vec![],
+                requires_capabilities: vec![],
+                requires_tools: vec![],
+                requires_nightly: false,
             }),
             GeneratorOptionItem::Option(GeneratorOption {
                 name: "victim".to_string(),
@@ -1028,6 +1142,9 @@ mod test {
                 compatible: IndexMap::new(),
                 sets: IndexMap::new(),
                 requires: vec![],
+                requires_capabilities: vec![],
+                requires_tools: vec![],
+                requires_nightly: false,
             }),
             GeneratorOptionItem::Option(GeneratorOption {
                 name: "wrong-chip".to_string(),
@@ -1037,6 +1154,9 @@ mod test {
                 compatible: wrong_chip_compat,
                 sets: IndexMap::new(),
                 requires: vec!["!victim".to_string()],
+                requires_capabilities: vec![],
+                requires_tools: vec![],
+                requires_nightly: false,
             }),
             GeneratorOptionItem::Option(GeneratorOption {
                 name: "unmet-pos".to_string(),
@@ -1046,6 +1166,9 @@ mod test {
                 compatible: IndexMap::new(),
                 sets: IndexMap::new(),
                 requires: vec!["missing".to_string(), "!victim".to_string()],
+                requires_capabilities: vec![],
+                requires_tools: vec![],
+                requires_nightly: false,
             }),
             GeneratorOptionItem::Option(GeneratorOption {
                 name: "neg-conflict".to_string(),
@@ -1055,12 +1178,16 @@ mod test {
                 compatible: IndexMap::new(),
                 sets: IndexMap::new(),
                 requires: vec!["!victim".to_string()],
+                requires_capabilities: vec![],
+                requires_tools: vec![],
+                requires_nightly: false,
             }),
         ];
         let mut active = ActiveConfiguration {
             selected: vec![],
             flat_options: flatten_options(&options),
             options,
+            facts: None,
         };
         active.select("esp32");
         active.select("victim");
@@ -1115,6 +1242,9 @@ mod test {
                 compatible: IndexMap::new(),
                 sets: IndexMap::new(),
                 requires: vec![],
+                requires_capabilities: vec![],
+                requires_tools: vec![],
+                requires_nightly: false,
             }),
             GeneratorOptionItem::Option(GeneratorOption {
                 name: "log".to_string(),
@@ -1124,6 +1254,9 @@ mod test {
                 compatible: IndexMap::new(),
                 sets: IndexMap::new(),
                 requires: vec![],
+                requires_capabilities: vec![],
+                requires_tools: vec![],
+                requires_nightly: false,
             }),
             GeneratorOptionItem::Option(GeneratorOption {
                 name: "pretty-logs".to_string(),
@@ -1133,12 +1266,16 @@ mod test {
                 compatible: pretty_logs_compat,
                 sets: IndexMap::new(),
                 requires: vec![],
+                requires_capabilities: vec![],
+                requires_tools: vec![],
+                requires_nightly: false,
             }),
         ];
         let mut active = ActiveConfiguration {
             selected: vec![],
             flat_options: flatten_options(&options),
             options,
+            facts: None,
         };
 
         // Baseline: nothing picked in log-frontend, so `pretty-logs` can't be
@@ -1171,5 +1308,59 @@ mod test {
             "pretty-logs must be cleared when log-frontend moves off defmt"
         );
         assert!(!active.is_option_compatible(&pretty));
+    }
+
+    #[test]
+    fn requires_capabilities_gates_on_chip_symbols() {
+        // An option that requires the `soc_has_wifi` symbol. With no facts set
+        // (no chip picked) capabilities are unconstrained, so it's compatible.
+        // Once facts are set, compatibility follows whether the chip declares
+        // the symbol, and a chip that lacks it cascades the option out.
+        let mut wifi = GeneratorOption {
+            name: "wifi".to_string(),
+            display_name: "Wi-Fi".to_string(),
+            ..Default::default()
+        };
+        wifi.requires_capabilities = vec!["soc_has_wifi".to_string()];
+
+        let options = vec![GeneratorOptionItem::Option(wifi.clone())];
+        let mut active = ActiveConfiguration {
+            selected: vec![],
+            flat_options: flatten_options(&options),
+            options,
+            facts: None,
+        };
+
+        // Unconstrained (no chip): compatible + toggleable.
+        assert!(active.is_option_compatible(&wifi));
+        assert!(active.is_option_toggleable(&wifi));
+        active.select("wifi");
+        assert!(active.is_selected("wifi"));
+
+        // Every chip carries a field for every symbol; only the value differs.
+        let chip_with = |has_wifi: bool| Facts {
+            chip: Some(IndexMap::from([
+                ("soc_has_wifi".to_string(), FactValue::Bool(has_wifi)),
+                ("soc_has_bt".to_string(), FactValue::Bool(true)),
+            ])),
+            ..Default::default()
+        };
+
+        // A chip that HAS the symbol keeps it compatible and selected.
+        active.set_facts(Some(chip_with(true)));
+        assert!(active.is_option_compatible(&wifi));
+        assert!(active.is_selected("wifi"));
+
+        // Switching to a chip that LACKS it makes the option incompatible and
+        // cascades it out of the selection (mirrors a `compatible` mismatch).
+        // The field is *present* and false — that is what lets a template's
+        // `chip.soc_has_wifi` be falsy rather than an unknown-field error.
+        active.set_facts(Some(chip_with(false)));
+        assert!(!active.is_option_compatible(&wifi));
+        assert!(
+            !active.is_selected("wifi"),
+            "wifi must be cascaded out on a chip lacking soc_has_wifi"
+        );
+        assert!(!active.is_option_toggleable(&wifi));
     }
 }
