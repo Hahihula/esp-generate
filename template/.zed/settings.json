@@ -1,4 +1,3 @@
-//%includefile option("zed")
 {
     "lsp": {
         "rust-analyzer": {

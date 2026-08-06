@@ -7,19 +7,23 @@ use std::thread;
 use anyhow::Result;
 use esp_generate::template::{GeneratorOption, GeneratorOptionItem};
 
-use crate::{Chip, check};
+use crate::Chip;
 
 /// Chip-agnostic metadata for a single installed rustup toolchain.
 ///
-/// Scanning this information is expensive (one `rustc +tc --print target-list`
-/// and one `rustc +tc --version` per toolchain), so we capture it once up front
-/// and then derive per-chip filtered views via [`toolchains_for_chip`] without
-/// spawning any more subprocesses.
+/// Scanning is expensive — one `rustc +tc --print target-list` per toolchain —
+/// so we capture it once up front and derive per-chip filtered views via
+/// [`toolchains_for_chip`] without spawning any more subprocesses.
+///
+/// There is deliberately **no version here.** The scan used to also run
+/// `rustc +tc --version` on every toolchain to support an MSRV filter; now that
+/// MSRV is an advisory rather than a filter dimension, that is one subprocess
+/// per installed toolchain saved on every startup, and the version of the
+/// toolchain the user picks is checked once, later, by `check`.
 #[derive(Debug, Clone)]
 pub struct ToolchainInfo {
     pub name: String,
     pub targets: BTreeSet<String>,
-    pub version: Option<check::Version>,
 }
 
 /// The filtered list of toolchains usable for a given chip, alongside any
@@ -61,9 +65,9 @@ impl ToolchainScan {
 }
 /// Start discovering all installed rustup toolchains in a background thread.
 ///
-/// No chip or MSRV is involved here — the scan is chip-agnostic on purpose so
-/// that switching chips in the TUI does not require re-scanning. Per-chip
-/// filtering is done in-memory by [`toolchains_for_chip`].
+/// No chip is involved here — the scan is chip-agnostic on purpose so that
+/// switching chips in the TUI does not require re-scanning. Per-chip filtering
+/// is done in-memory by [`toolchains_for_chip`].
 pub fn start_toolchain_scan() -> ToolchainScan {
     let (tx, rx) = mpsc::channel();
 
@@ -75,8 +79,8 @@ pub fn start_toolchain_scan() -> ToolchainScan {
     ToolchainScan { rx, cached: None }
 }
 
-/// Enumerate every installed rustup toolchain and capture its target list and
-/// version. Never fails hard — subprocess errors degrade to "no toolchains".
+/// Enumerate every installed rustup toolchain and capture its target list.
+/// Never fails hard — subprocess errors degrade to "no toolchains".
 fn scan_installed_toolchains() -> Result<Vec<ToolchainInfo>> {
     let output = match Command::new("rustup").args(["toolchain", "list"]).output() {
         Ok(res) => res,
@@ -111,7 +115,7 @@ fn scan_installed_toolchains() -> Result<Vec<ToolchainInfo>> {
     Ok(available)
 }
 
-/// Collect target list + version for a single toolchain. Returns `None` if the
+/// Collect the target list for a single toolchain. Returns `None` if the
 /// toolchain can't be introspected at all (e.g. not a real rustup toolchain —
 /// we skip rather than poison the whole scan).
 fn inspect_toolchain(name: &str) -> Option<ToolchainInfo> {
@@ -144,15 +148,9 @@ fn inspect_toolchain(name: &str) -> Option<ToolchainInfo> {
         .filter(|l| !l.is_empty())
         .collect();
 
-    let version = check::get_version("rustc", &[&format!("+{name}")]);
-    if version.is_none() {
-        log::warn!("Failed to detect rustc version for toolchain `{name}`; skipping MSRV check");
-    }
-
     Some(ToolchainInfo {
         name: name.to_string(),
         targets,
-        version,
     })
 }
 
@@ -176,9 +174,10 @@ fn active_rustup_toolchain() -> Option<String> {
 /// Pure, cheap filter over a [`ToolchainInfo`] slice for the given chip.
 ///
 /// Recomputed on demand (e.g. whenever the user switches chip in the TUI).
-/// All per-chip concerns live here — target-triple match, MSRV gate, Xtensa
-/// exclusion of generic toolchains, and CLI-toolchain sort/validation — so
-/// that the cached scan data stays untouched across chip switches.
+/// All per-chip concerns live here — target-triple match, the `requires_nightly`
+/// narrowing, Xtensa exclusion of generic toolchains, and CLI-toolchain
+/// sort/validation — so that the cached scan data stays untouched across chip
+/// switches.
 ///
 /// When `chip` is `None` every scanned toolchain is returned unfiltered;
 /// the per-chip gates run again on the next rebuild once a chip is picked.
@@ -190,7 +189,7 @@ fn active_rustup_toolchain() -> Option<String> {
 pub fn toolchains_for_chip(
     all: &[ToolchainInfo],
     chip: Option<Chip>,
-    msrv: &check::Version,
+    requires_nightly: bool,
     cli_hint: Option<&str>,
 ) -> FilteredToolchains {
     let Some(chip) = chip else {
@@ -203,10 +202,19 @@ pub fn toolchains_for_chip(
 
     let target = chip.metadata().target().to_string();
 
+    // Target support and `requires_nightly` are the only two dimensions.
+    //
+    // **MSRV is deliberately not one.** The picker chooses a floating channel
+    // (`stable`, `esp`, …) whose version moves under it, so filtering by the
+    // template's `rust-version` answers a question about *today's* rustc that
+    // the choice doesn't fix — and it would empty the picker for a user whose
+    // stable is one release behind, offering no way forward. Enforcement
+    // belongs to Cargo: `rust-version` in the generated project fails the
+    // build with a clear message, and `check` gives an advisory beforehand.
     let mut names: Vec<String> = all
         .iter()
         .filter(|tc| tc.targets.contains(target.as_str()))
-        .filter(|tc| tc.version.as_ref().is_none_or(|v| v >= msrv))
+        .filter(|tc| !requires_nightly || is_nightly(&tc.name))
         .map(|tc| tc.name.clone())
         .collect();
 
@@ -266,6 +274,17 @@ pub fn toolchains_for_chip(
 
 fn is_generic_toolchain(name: &str) -> bool {
     name.starts_with("stable") || name.starts_with("beta") || name.starts_with("nightly")
+}
+
+/// Whether a rustup toolchain name denotes a nightly channel.
+///
+/// Matched on the name because that is what the user picks and what ends up in
+/// `rust-toolchain.toml`. A dated nightly (`nightly-2026-01-31`) and a
+/// host-qualified one (`nightly-aarch64-apple-darwin`) both count; a custom
+/// toolchain linked under a nightly-derived name does too, which is the
+/// intended reading — the user named it.
+fn is_nightly(name: &str) -> bool {
+    name.starts_with("nightly")
 }
 
 /// Stash for the original "Scanning installed toolchains…" placeholder.
@@ -350,5 +369,81 @@ impl ToolchainCategory {
             }
             return;
         }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    fn tc(name: &str, target: &str) -> ToolchainInfo {
+        ToolchainInfo {
+            name: name.to_string(),
+            targets: BTreeSet::from([target.to_string()]),
+        }
+    }
+
+    /// The RISC-V target every non-Xtensa test chip below uses.
+    const RISCV: &str = "riscv32imac-unknown-none-elf";
+
+    fn installed() -> Vec<ToolchainInfo> {
+        vec![
+            // Deliberately *older* than any plausible template MSRV.
+            tc("stable", RISCV),
+            tc("nightly", RISCV),
+            tc("nightly-2026-01-31", RISCV),
+            tc("esp", "xtensa-esp32s3-none-elf"),
+        ]
+    }
+
+    /// The behaviour change: a toolchain older than the template's MSRV is
+    /// still offered. The picker chooses a floating channel whose version moves
+    /// under it, so filtering it out would empty the list for a user one
+    /// release behind and give them no way forward — while Cargo's
+    /// `rust-version` still fails the build with a clear message.
+    #[test]
+    fn an_old_toolchain_is_still_offered() {
+        let filtered = toolchains_for_chip(&installed(), Some(Chip::Esp32c6), false, None);
+
+        assert!(
+            filtered.names.contains(&"stable".to_string()),
+            "MSRV must not be a filter dimension, got {:?}",
+            filtered.names
+        );
+        assert!(filtered.warnings.is_empty(), "{:?}", filtered.warnings);
+    }
+
+    #[test]
+    fn requires_nightly_narrows_to_nightly_channels() {
+        let filtered = toolchains_for_chip(&installed(), Some(Chip::Esp32c6), true, None);
+
+        assert_eq!(
+            filtered.names,
+            vec!["nightly".to_string(), "nightly-2026-01-31".to_string()],
+            "only nightly channels survive, dated ones included"
+        );
+    }
+
+    #[test]
+    fn target_support_is_still_a_filter() {
+        // `esp` has no RISC-V target, so it never appears for a C6.
+        let filtered = toolchains_for_chip(&installed(), Some(Chip::Esp32c6), false, None);
+        assert!(!filtered.names.contains(&"esp".to_string()));
+    }
+
+    #[test]
+    fn an_unpicked_chip_filters_nothing() {
+        let filtered = toolchains_for_chip(&installed(), None, true, None);
+        assert_eq!(filtered.names.len(), installed().len());
+    }
+
+    #[test]
+    fn nightly_names_are_recognised_by_channel() {
+        assert!(is_nightly("nightly"));
+        assert!(is_nightly("nightly-2026-01-31"));
+        assert!(is_nightly("nightly-aarch64-apple-darwin"));
+        assert!(!is_nightly("stable"));
+        assert!(!is_nightly("beta"));
+        assert!(!is_nightly("esp"));
     }
 }

@@ -1,8 +1,7 @@
-#%includefile false
 required:
   - chip
 options:
-  - !Include .template/chip.yaml
+  - !Include builtin:chip
 
   - !Include .template/module.yaml
 
@@ -66,6 +65,7 @@ options:
   - !Option
     name: stack-smashing-protection
     display_name: Enable stack smashing protection.
+    requires_nightly: true
     help: Requires nightly Rust. Note that this option generates additional checks in most functions
       and will slow down your code.
 

@@ -8,10 +8,9 @@ use std::{
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
 use esp_generate::{
-    Chip,
+    Chip, TemplateSource,
     config::{ActiveConfiguration, find_option, flatten_options},
     template::{GeneratorOption, GeneratorOptionCategory, GeneratorOptionItem, Template},
-    template_files::TEMPLATE_FILES,
 };
 use itertools::Itertools;
 use log::info;
@@ -267,17 +266,15 @@ fn options_for_chip(chip: Chip, all_combinations: bool) -> Result<Vec<Vec<String
         IGNORED_CATEGORIES
     };
 
-    // Reuse the same bundled file table the binary uses so `!Include`
-    // expansion resolves identically here (and so xtask doesn't depend on
-    // its own relative path to the `template/` directory).
-    let root_yaml = TEMPLATE_FILES
-        .iter()
-        .find_map(|(k, v)| (*k == "template.yaml").then_some(*v))
+    // Reuse the same template source the binary uses so `!Include` expansion
+    // resolves identically here (and so xtask doesn't depend on its own
+    // relative path to the `template/` directory).
+    let source = TemplateSource::Bundled;
+    let root_yaml = source
+        .get("template.yaml")
         .ok_or_else(|| anyhow::anyhow!("bundled templates missing template.yaml"))?;
     let template = Template::load(root_yaml, |path| {
-        TEMPLATE_FILES
-            .iter()
-            .find_map(|(k, v)| (*k == path).then(|| v.to_string()))
+        esp_generate::builtin::resolve(path).or_else(|| source.get(path).map(str::to_string))
     })
     .map_err(|e| anyhow::anyhow!("failed to load bundled template: {e}"))?;
 

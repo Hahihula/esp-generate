@@ -1,24 +1,24 @@
 //! The file-directive processor — a thin shell around [somni-template].
 //!
-//! `process_file` renders a single template file. The template *language* —
-//! `if`/`else if`/`else`/`endif`, `for`, `replace`, `{{ interpolation }}` and
-//! the expression grammar — belongs to somni-template and is versioned by that
-//! dependency's semver. This module owns only the two things the engine has no
-//! concept of, plus the facts:
+//! [`Renderer::render`] turns one template file into a string. The template
+//! *language* — `if`/`else if`/`else`/`endif`, `for`, `replace`,
+//! `{{ interpolation }}` and the expression grammar — belongs to
+//! somni-template and is versioned by that dependency's semver. This module
+//! owns the **facts** that language evaluates against, and nothing else.
 //!
-//! - **`includefile <cond>`** — whether the file is emitted at all;
-//! - **`include_as <path>`** — what the output file is called.
+//! In particular it does **not** decide whether a file is emitted or what it is
+//! called. `Template::render` maps a string to a string; expressing file
+//! lifecycle as directives (`includefile`, `include_as`) put those decisions
+//! inside the content layer, where the binary could not see them without
+//! parsing every file. They are now rules in the template's `metadata.toml`,
+//! and reach the SDK through [`Renderer::evaluate`] and [`Renderer::output_path`]
+//! — so a manifest condition and the same condition in a template body mean
+//! exactly the same thing.
 //!
-//! Both are file-*lifecycle* directives: `Template::render` maps a string to a
-//! string and has no notion of a file that should not exist, or of an output
-//! path. They are stripped from the head of the source before compilation.
-//!
-//! The engine's own `include` covers the *content* half: a file that comes in
-//! two variants is one emitted file that includes one of two **partials**,
-//! rather than two files whose `includefile` conditions have to stay exact
-//! negations of each other. A partial carries `includefile false` so it is not
-//! emitted on its own; when included, its head directives are stripped and the
-//! including file decides where the result lands.
+//! The engine's own `include` covers content composition: a file that comes in
+//! two variants is one emitted file that includes one of two **partials**, and
+//! the partials live under the manifest's reserved directory so nothing has to
+//! mark them as "not a file".
 //!
 //! ## Syntax
 //!
@@ -76,7 +76,7 @@
 //! `{{ str(dram2_uninit_size) }}`; the bare form is a render-time type error.
 //! It still compares as a number inside a condition.
 //!
-//! `include_as` remains a **literal name lookup** into [`Facts::values`] (never
+//! The manifest's output path is a **literal name lookup** into [`Facts::values`] (never
 //! a somni expression), so substitution-only names may contain dashes — those
 //! simply aren't reachable from an expression.
 //!
@@ -94,7 +94,7 @@ use somni_template::{BlockStyle, Env, SomniStruct, Syntax, Template, TypedValue}
 use crate::contract::is_reserved_name;
 
 /// A substitution value. The [`Display`](std::fmt::Display) form is what
-/// `include_as` splices into a path; the variant is what somni sees, so an
+/// an output path splices in; the variant is what somni sees, so an
 /// [`Int`](FactValue::Int) fact supports arithmetic and ordering in a condition
 /// while a [`Str`](FactValue::Str) supports string equality.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -188,7 +188,7 @@ pub struct Facts {
     pub chip: Option<IndexMap<String, FactValue>>,
     /// Known-name vocabularies backing the unknown-name hard error.
     pub vocabulary: Vocabulary,
-    /// Substitution values: spliced literally by `include_as`, and exposed to
+    /// Substitution values: spliced literally into an output path, and exposed to
     /// expressions as somni values when the name is an identifier.
     pub values: HashMap<String, FactValue>,
     /// Whether the selected module reserves any GPIOs. Backs `has_reserved_pins`.
@@ -217,20 +217,36 @@ fn is_somni_identifier(name: &str) -> bool {
         && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
-/// A directive-processing failure carrying the 1-based source line, so the
-/// binary can surface `file:line: message`. Malformed directives, bad
-/// conditions, and target-escaping `include_as` paths are all hard errors
-/// rather than panics or silent no-ops.
+/// A processing failure. Malformed directives, bad conditions, and
+/// unresolvable includes are hard errors rather than panics or silent no-ops.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcessError {
-    /// 1-based line number in the source template file.
-    pub line: usize,
+    /// 1-based line in the template file, when the failure has one.
+    ///
+    /// `None` for failures that are not *in* a file — a manifest condition, for
+    /// instance, which is authored in `metadata.toml` and has no line the SDK
+    /// could name. Modelled as an option rather than a sentinel because a
+    /// rendered `line 0:` is worse than no line at all.
+    pub line: Option<usize>,
     pub message: String,
+}
+
+impl ProcessError {
+    /// A failure at a known 1-based line.
+    fn at(line: usize, message: String) -> Self {
+        ProcessError {
+            line: Some(line),
+            message,
+        }
+    }
 }
 
 impl std::fmt::Display for ProcessError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "line {}: {}", self.line, self.message)
+        match self.line {
+            Some(line) => write!(f, "line {line}: {}", self.message),
+            None => f.write_str(&self.message),
+        }
     }
 }
 
@@ -436,7 +452,7 @@ fn interpolate(template: &str, values: &HashMap<String, FactValue>) -> String {
 }
 
 /// Whether `path` is a contained relative path: not absolute and free of any
-/// `..` or drive-letter component. Used to reject `include_as`/output paths
+/// `..` or drive-letter component. Used to reject include and output paths
 /// that would let generation write outside the target directory.
 pub fn is_safe_relative_path(path: &str) -> bool {
     if path.starts_with(['/', '\\']) {
@@ -458,77 +474,57 @@ fn line_of(source: &str, offset: usize) -> usize {
         .map_or(1, |head| head.matches('\n').count() + 1)
 }
 
-/// The file-lifecycle directives lifted off the head of a template.
-struct FileDirectives<'a> {
-    /// The `includefile` condition, if the file declares one.
-    condition: Option<&'a str>,
-    /// The raw `include_as` path, if the file declares one.
-    rename: Option<(&'a str, usize)>,
-    /// The source with those lines removed.
-    body: String,
-    /// How many lines were removed, so error lines can be shifted back.
-    consumed: usize,
-}
-
-/// Lift `includefile` / `include_as` off the head of the source.
+/// A prepared context: the selections and facts one generation run shares.
 ///
-/// They are only recognised before the first line of real content, which is
-/// what makes removing them safe: every remaining line keeps its relative
-/// order, and reported line numbers just need `consumed` added back.
-fn take_file_directives<'a>(source: &'a str, style: CommentStyle) -> FileDirectives<'a> {
-    let marker = style.marker();
-    let mut condition = None;
-    let mut rename = None;
-    let mut consumed = 0;
-
-    for (idx, line) in source.lines().enumerate() {
-        let trimmed = line.trim();
-        let Some(rest) = trimmed.strip_prefix(&marker) else {
-            break;
-        };
-        let rest = rest.trim_start();
-
-        if let Some(cond) = strip_keyword(rest, "includefile") {
-            condition = Some(cond);
-        } else if let Some(path) = strip_keyword(rest, "include_as") {
-            rename = Some((path, idx + 1));
-        } else {
-            break;
-        }
-        consumed += 1;
-    }
-
-    // `lines()` drops the trailing newline, so rebuild from the raw source to
-    // avoid changing whether the body ends with one.
-    let body = if consumed == 0 {
-        source.to_string()
-    } else {
-        let mut remaining = source;
-        for _ in 0..consumed {
-            remaining = remaining.split_once('\n').map_or("", |(_, rest)| rest);
-        }
-        remaining.to_string()
-    };
-
-    FileDirectives {
-        condition,
-        rename,
-        body,
-        consumed,
-    }
+/// Built **once** and reused for every file and every manifest condition. That
+/// is the whole reason this is a type rather than a set of parameters — the
+/// closures [`Env::function`] takes must be `'static`, so the context has to
+/// live behind an `Rc`, and threading facts through as `&Facts` meant deep-
+/// cloning the chip's symbol map once per file *and* once per condition.
+pub struct Renderer {
+    shared: Rc<Shared>,
 }
 
-/// Strip a case-insensitive directive keyword and the whitespace after it.
-fn strip_keyword<'a>(rest: &'a str, keyword: &str) -> Option<&'a str> {
-    let head = rest.get(..keyword.len())?;
-    if !head.eq_ignore_ascii_case(keyword) {
-        return None;
+impl Renderer {
+    /// Prepare a context for one generation run.
+    pub fn new(selected: &[String], selected_groups: &[String], facts: &Facts) -> Self {
+        Renderer {
+            shared: Rc::new(Shared {
+                selected: selected.to_vec(),
+                selected_groups: selected_groups.to_vec(),
+                facts: facts.clone(),
+                unknown: RefCell::new(None),
+            }),
+        }
     }
-    let arg = &rest[keyword.len()..];
-    if !arg.starts_with(char::is_whitespace) {
-        return None;
+
+    /// Evaluate a standalone boolean condition against the same facts a
+    /// template body sees.
+    ///
+    /// This is the manifest's entry point: the binary reads
+    /// `when = 'option("wokwi")'` out of `metadata.toml` as data and asks here
+    /// whether it holds. The binary decides *which files exist*; the SDK only
+    /// answers what the expression means, so a condition in a manifest and the
+    /// same condition in a template body can never disagree.
+    ///
+    /// `what` names the condition's source — a manifest key, say — and is
+    /// placed in the message directly rather than patched into it afterwards.
+    /// There is no line to report: the condition is not in a template file.
+    pub fn evaluate(&self, condition: &str, what: &str) -> Result<bool, ProcessError> {
+        // Any comment style renders the same probe; `#` is as good as another.
+        let style = CommentStyle { base: "#" };
+        self.eval_condition(condition, &style.syntax(), style, what, None)
     }
-    Some(arg.trim())
+
+    /// Expand `{name}` placeholders in an output path from [`Facts::values`].
+    ///
+    /// For the manifest's `as` key, which names the file a template renders to.
+    /// Deliberately **not** a somni expression — a path is not code, and
+    /// keeping it a literal lookup lets substitution-only names contain dashes.
+    /// An unknown `{name}` is left verbatim.
+    pub fn output_path(&self, path: &str) -> String {
+        interpolate(path, &self.shared.facts.values)
+    }
 }
 
 /// Resolves an `include` path to that template file's raw contents.
@@ -538,157 +534,121 @@ fn strip_keyword<'a>(rest: &'a str, keyword: &str) -> Option<&'a str> {
 /// error naming the path.
 pub type IncludeLoader<'a> = &'a mut dyn FnMut(&str) -> Result<String, String>;
 
-/// Process a single template file, returning the rendered contents, or `None`
-/// if an `includefile` directive excluded the file entirely.
+/// Render a single template file.
 ///
-/// `file_path` is updated in place if the file carries an `include_as`
-/// directive; the rewritten path is validated to stay inside the target
-/// directory. Malformed directives are reported as [`ProcessError`] with the
-/// offending line, never panicked.
+/// Whether this file is written at all, and under what name, is not decided
+/// here — see the module docs. By the time `process_file` is called the caller
+/// has already established the file is wanted.
+///
+/// Malformed directives are reported as [`ProcessError`] with the offending
+/// line, never panicked.
 ///
 /// `load` resolves `include` directives. An included file is a **partial**: its
-/// body is inlined into the caller and shares the caller's facts, and its own
-/// `includefile` / `include_as` head directives are stripped rather than
-/// obeyed — the including file decides whether and where the result is written.
-/// That is what lets a partial also carry `includefile false`, so it is not
-/// emitted as a file of its own.
+/// body is inlined into the caller and shares the caller's facts.
 ///
 /// A key absent from [`Facts::values`] is intentionally left unsubstituted by
-/// `include_as` (the literal placeholder survives) — that's the template's
-/// "override or keep the default" idiom. Distinguishing an optionally-absent
+/// [`interpolate_path`] (the literal placeholder survives) — that's the
+/// template's "override or keep the default" idiom. Distinguishing an
+/// optionally-absent
 /// value from a typo needs the full declared-key universe, which only the
 /// binary's `check` command has; flagging unknown keys is `check`'s job.
-pub fn process_file(
-    contents: &str,             // Raw content of the file
-    selected: &[String],        // Selected option names
-    selected_groups: &[String], // Selection groups that have a pick
-    facts: &Facts,              // Chip-derived facts + substitution values
-    file_path: &mut String,     // File path to be modified
-    load: IncludeLoader<'_>,    // Resolves `include` paths
-) -> Result<Option<String>, ProcessError> {
-    // A leading UTF-8 BOM is a file-level encoding marker, not content: editors
-    // on Windows add it silently. `str::trim` won't remove it (U+FEFF is not
-    // `char::is_whitespace`), so leaving it attached would demote a first-line
-    // directive to literal text and corrupt the first token of the generated
-    // file. Only the file-leading one is a BOM — a U+FEFF anywhere else is
-    // ordinary content and is left alone.
-    let contents = contents.strip_prefix('\u{feff}').unwrap_or(contents);
+impl Renderer {
+    /// Render one template file.
+    pub fn render(&self, contents: &str, load: IncludeLoader<'_>) -> Result<String, ProcessError> {
+        // The unknown-name slot is shared across every use of this context, so
+        // clear it first. An earlier file that failed to *compile* never
+        // reached the point where the slot is taken, and a leftover would then
+        // be reported against this file.
+        self.shared.unknown.borrow_mut().take();
 
-    let style = CommentStyle::infer(contents);
-    let syntax = style.syntax();
-    let directives = take_file_directives(contents, style);
+        // A leading UTF-8 BOM is a file-level encoding marker, not content:
+        // editors on Windows add it silently. `str::trim` won't remove it
+        // (U+FEFF is not `char::is_whitespace`), so leaving it attached would
+        // demote a first-line directive to literal text and corrupt the first
+        // token of the generated file. Only the file-leading one is a BOM — a
+        // U+FEFF anywhere else is ordinary content and is left alone.
+        let body = contents.strip_prefix('\u{feff}').unwrap_or(contents);
 
-    let shared = Rc::new(Shared {
-        selected: selected.to_vec(),
-        selected_groups: selected_groups.to_vec(),
-        facts: facts.clone(),
-        unknown: RefCell::new(None),
-    });
+        let style = CommentStyle::infer(body);
+        let syntax = style.syntax();
 
-    // `includefile` first: if the file is excluded there is no point compiling
-    // the body, and a template may legitimately contain directives that only
-    // make sense once the file is included at all.
-    if let Some(cond) = directives.condition
-        && !eval_condition(cond, &syntax, style, &shared, 1)?
-    {
-        return Ok(None);
-    }
+        // The path is checked here as well as by the loader, so a
+        // filesystem-backed loader can't be walked out of its root.
+        let mut load_partial = |path: &str| -> Result<String, String> {
+            if !is_safe_relative_path(path) {
+                return Err(format!(
+                    "`{path}` escapes the template root (absolute or `..` paths are not allowed)"
+                ));
+            }
+            let raw = load(path)?;
+            Ok(raw.strip_prefix('\u{feff}').unwrap_or(&raw).to_string())
+        };
 
-    if let Some((path, line)) = directives.rename {
-        let renamed = interpolate(path, &facts.values);
-        if !is_safe_relative_path(&renamed) {
-            return Err(ProcessError {
-                line,
-                message: format!(
-                    "`include_as` path `{renamed}` escapes the target directory \
-                     (absolute or `..` paths are not allowed)"
-                ),
-            });
+        let template = Template::compile_with(body, &syntax, &mut load_partial)
+            .map_err(|e| template_error(body, e, "invalid template directive"))?;
+
+        let rendered = template
+            .render(build_env(&self.shared))
+            .map_err(|e| template_error(body, e, "render failed"))?;
+
+        // A vocabulary miss outranks whatever the expression evaluated to,
+        // since "unknown capability" is the more actionable diagnostic.
+        // Rendering may have succeeded regardless, so this is checked on the
+        // success path too.
+        if let Some(reason) = self.shared.unknown.borrow_mut().take() {
+            return Err(ProcessError::at(1, reason));
         }
-        *file_path = renamed;
+
+        Ok(rendered)
     }
-
-    let body = directives.body.as_str();
-
-    // Partials are inlined into this file, so their own head directives are
-    // stripped: `includefile false` on a partial means "not a file of its own",
-    // not "skip this include". The path is checked here as well as by the
-    // loader, so a filesystem-backed loader can't be walked out of its root.
-    let mut load_partial = |path: &str| -> Result<String, String> {
-        if !is_safe_relative_path(path) {
-            return Err(format!(
-                "`{path}` escapes the template root (absolute or `..` paths are not allowed)"
-            ));
-        }
-        let raw = load(path)?;
-        let raw = raw.strip_prefix('\u{feff}').unwrap_or(&raw).to_string();
-        Ok(take_file_directives(&raw, CommentStyle::infer(&raw)).body)
-    };
-
-    let template = Template::compile_with(body, &syntax, &mut load_partial)
-        .map_err(|e| template_error(body, e, directives.consumed, "invalid template directive"))?;
-
-    let rendered = template
-        .render(build_env(&shared))
-        .map_err(|e| template_error(body, e, directives.consumed, "render failed"))?;
-
-    // A vocabulary miss outranks whatever the expression evaluated to, since
-    // "unknown capability" is the more actionable diagnostic. Rendering may
-    // have succeeded regardless, so this is checked on the success path too.
-    if let Some(reason) = shared.unknown.borrow_mut().take() {
-        return Err(ProcessError {
-            line: 1,
-            message: reason,
-        });
-    }
-
-    Ok(Some(rendered))
 }
 
 /// Evaluate a standalone boolean condition by rendering it as a one-line
 /// template, so conditions and template bodies always go through the same
 /// engine and the same [`Env`] — there is no second expression evaluator to
 /// drift out of sync.
-fn eval_condition(
-    cond: &str,
-    syntax: &Syntax,
-    style: CommentStyle,
-    shared: &Rc<Shared>,
-    line: usize,
-) -> Result<bool, ProcessError> {
-    let marker = style.marker();
-    let probe = format!("{marker}if {cond}\nyes\n{marker}endif\n");
+impl Renderer {
+    fn eval_condition(
+        &self,
+        cond: &str,
+        syntax: &Syntax,
+        style: CommentStyle,
+        what: &str,
+        line: Option<usize>,
+    ) -> Result<bool, ProcessError> {
+        let marker = style.marker();
+        let probe = format!("{marker}if {cond}\nyes\n{marker}endif\n");
 
-    let render = Template::compile(&probe, syntax).and_then(|t| t.render(build_env(shared)));
+        let render =
+            Template::compile(&probe, syntax).and_then(|t| t.render(build_env(&self.shared)));
 
-    if let Some(reason) = shared.unknown.borrow_mut().take() {
-        return Err(ProcessError {
+        // `what` is interpolated here, at the point the message is built,
+        // rather than substituted into a finished string afterwards. Patching
+        // it in was fragile in both directions: it depended on this wording
+        // containing the word it looked for, and it could rewrite an
+        // occurrence inside the author's own condition text.
+        let fail = |reason: String| ProcessError {
             line,
-            message: format!("invalid `includefile` condition `{cond}`: {reason}"),
-        });
-    }
+            message: format!("invalid {what} `{cond}`: {reason}"),
+        };
 
-    match render {
-        Ok(out) => Ok(out.trim() == "yes"),
-        Err(e) => Err(ProcessError {
-            line,
-            message: format!("invalid `includefile` condition `{cond}`: {}", e.message),
-        }),
+        if let Some(reason) = self.shared.unknown.borrow_mut().take() {
+            return Err(fail(reason));
+        }
+
+        match render {
+            Ok(out) => Ok(out.trim() == "yes"),
+            Err(e) => Err(fail(e.message.to_string())),
+        }
     }
 }
 
-/// Map a [`somni_template::TemplateError`] back onto a source line, adding back
-/// the head lines that were stripped before compilation.
-fn template_error(
-    body: &str,
-    error: somni_template::TemplateError,
-    consumed: usize,
-    what: &str,
-) -> ProcessError {
-    ProcessError {
-        line: line_of(body, error.location.start) + consumed,
-        message: format!("{what}: {}", error.message),
-    }
+/// Map a [`somni_template::TemplateError`] back onto a source line.
+fn template_error(body: &str, error: somni_template::TemplateError, what: &str) -> ProcessError {
+    ProcessError::at(
+        line_of(body, error.location.start),
+        format!("{what}: {}", error.message),
+    )
 }
 
 #[cfg(test)]
@@ -713,59 +673,34 @@ mod test {
     }
 
     /// Render with a selected-name list and no chip facts. Expects success.
-    fn process(contents: &str, selected: &[&str]) -> Option<String> {
+    fn process(contents: &str, selected: &[&str]) -> String {
         let selected: Vec<String> = selected.iter().map(|s| s.to_string()).collect();
-        process_file(
-            contents,
-            &selected,
-            &[],
-            &Facts::default(),
-            &mut String::from("main.rs"),
-            &mut no_partials(),
-        )
-        .expect("process_file should succeed")
+        Renderer::new(&selected, &[], &Facts::default())
+            .render(contents, &mut no_partials())
+            .expect("process_file should succeed")
     }
 
     /// Render with explicit option *and* group selections.
-    fn process_with_groups(contents: &str, selected: &[&str], groups: &[&str]) -> Option<String> {
+    fn process_with_groups(contents: &str, selected: &[&str], groups: &[&str]) -> String {
         let selected: Vec<String> = selected.iter().map(|s| s.to_string()).collect();
         let groups: Vec<String> = groups.iter().map(|s| s.to_string()).collect();
-        process_file(
-            contents,
-            &selected,
-            &groups,
-            &Facts::default(),
-            &mut String::from("main.rs"),
-            &mut no_partials(),
-        )
-        .expect("process_file should succeed")
+        Renderer::new(&selected, &groups, &Facts::default())
+            .render(contents, &mut no_partials())
+            .expect("process_file should succeed")
     }
 
     /// Render with facts and no selections.
     fn process_facts(contents: &str, facts: &Facts) -> String {
-        process_file(
-            contents,
-            &[],
-            &[],
-            facts,
-            &mut String::from("m.rs"),
-            &mut no_partials(),
-        )
-        .expect("process_file should succeed")
-        .expect("file should be included")
+        Renderer::new(&[], &[], facts)
+            .render(contents, &mut no_partials())
+            .expect("process_file should succeed")
     }
 
     /// Returns the `ProcessError` or panics if the call unexpectedly succeeded.
     fn process_err(contents: &str, facts: &Facts) -> ProcessError {
-        process_file(
-            contents,
-            &[],
-            &[],
-            facts,
-            &mut String::from("f.rs"),
-            &mut no_partials(),
-        )
-        .expect_err("expected a ProcessError")
+        Renderer::new(&[], &[], facts)
+            .render(contents, &mut no_partials())
+            .expect_err("expected a ProcessError")
     }
 
     const NESTED: &str = "\
@@ -783,17 +718,17 @@ opt2
 
     #[test]
     fn nested_if_else_takes_the_inner_then_branch() {
-        assert_eq!(process(NESTED, &["opt1", "opt2"]).unwrap(), "opt1\nopt2\n");
+        assert_eq!(process(NESTED, &["opt1", "opt2"]), "opt1\nopt2\n");
     }
 
     #[test]
     fn nested_if_else_takes_the_outer_else_branch() {
-        assert_eq!(process(NESTED, &[]).unwrap(), "!opt1\n");
+        assert_eq!(process(NESTED, &[]), "!opt1\n");
     }
 
     #[test]
     fn nested_if_else_takes_the_inner_else_branch() {
-        assert_eq!(process(NESTED, &["opt1"]).unwrap(), "opt1\n!opt2\n");
+        assert_eq!(process(NESTED, &["opt1"]), "opt1\n!opt2\n");
     }
 
     #[test]
@@ -809,10 +744,10 @@ c
 none
 #%endif
 ";
-        assert_eq!(process(src, &["a", "b"]).unwrap(), "a\n");
-        assert_eq!(process(src, &["b", "c"]).unwrap(), "b\n");
-        assert_eq!(process(src, &["c"]).unwrap(), "c\n");
-        assert_eq!(process(src, &[]).unwrap(), "none\n");
+        assert_eq!(process(src, &["a", "b"]), "a\n");
+        assert_eq!(process(src, &["b", "c"]), "b\n");
+        assert_eq!(process(src, &["c"]), "c\n");
+        assert_eq!(process(src, &[]), "none\n");
     }
 
     #[test]
@@ -820,11 +755,8 @@ none
         // The bundled `Cargo.toml` indents directives four spaces inside a
         // feature list, so leading whitespace before the marker must be fine.
         let src = "deps = [\n    #%if option(\"a\")\n    \"a\",\n    #%endif\n]\n";
-        assert_eq!(
-            process(src, &["a"]),
-            Some("deps = [\n    \"a\",\n]\n".into())
-        );
-        assert_eq!(process(src, &[]), Some("deps = [\n]\n".into()));
+        assert_eq!(process(src, &["a"]), "deps = [\n    \"a\",\n]\n");
+        assert_eq!(process(src, &[]), "deps = [\n]\n");
     }
 
     #[test]
@@ -832,22 +764,16 @@ none
         // The whole reason the marker carries a `%`: a bare `//` prefix would
         // make the engine try to parse every comment as a directive.
         let src = "// just a comment\n//%if option(\"a\")\n//+let x = 1;\n//%endif\n";
-        assert_eq!(
-            process(src, &["a"]),
-            Some("// just a comment\nlet x = 1;\n".into())
-        );
-        assert_eq!(process(src, &[]), Some("// just a comment\n".into()));
+        assert_eq!(process(src, &["a"]), "// just a comment\nlet x = 1;\n");
+        assert_eq!(process(src, &[]), "// just a comment\n");
     }
 
     #[test]
     fn text_prefix_lines_are_emitted_uncommented() {
         // `//+` keeps the template itself compilable while emitting live code.
-        assert_eq!(process("//+let x = 1;\n", &[]), Some("let x = 1;\n".into()));
-        assert_eq!(process("#+key = 1\n", &[]), Some("key = 1\n".into()));
-        assert_eq!(
-            process("--+local x = 1\n", &[]),
-            Some("local x = 1\n".into())
-        );
+        assert_eq!(process("//+let x = 1;\n", &[]), "let x = 1;\n");
+        assert_eq!(process("#+key = 1\n", &[]), "key = 1\n");
+        assert_eq!(process("--+local x = 1\n", &[]), "local x = 1\n");
     }
 
     #[test]
@@ -858,11 +784,11 @@ none
         // difference is invisible until you diff the output.
         assert_eq!(
             process("fn main() {\n    //+    let p = init();\n}\n", &[]),
-            Some("fn main() {\n    let p = init();\n}\n".into())
+            "fn main() {\n    let p = init();\n}\n"
         );
         assert_eq!(
             process("fn main() {\n    //+let p = init();\n}\n", &[]),
-            Some("fn main() {\nlet p = init();\n}\n".into()),
+            "fn main() {\nlet p = init();\n}\n",
             "indentation before the marker is not preserved"
         );
     }
@@ -872,7 +798,7 @@ none
         // A `//+` later in the line is ordinary content, not a marker.
         assert_eq!(
             process("let s = \"a //+ b\";\n", &[]),
-            Some("let s = \"a //+ b\";\n".into())
+            "let s = \"a //+ b\";\n"
         );
     }
 
@@ -886,23 +812,12 @@ none
         );
     }
 
+    /// Rendering no longer decides whether or where a file lands — that is the
+    /// manifest's, so a head directive is just text now.
     #[test]
-    fn include_as_interpolates_values_and_rewrites_path() {
-        let mut facts = Facts::default();
-        facts.set_value("chip", "esp32c6");
-        let mut path = String::from("src/chip.rs");
-        let res = process_file(
-            "#%include_as src/{chip}.rs\nfn main() {}\n",
-            &[],
-            &[],
-            &facts,
-            &mut path,
-            &mut no_partials(),
-        )
-        .unwrap()
-        .unwrap();
-        assert_eq!(path, "src/esp32c6.rs");
-        assert_eq!(res, "fn main() {}\n");
+    fn the_renderer_no_longer_owns_the_file_lifecycle() {
+        let out = process_facts("plain content\n", &Facts::default());
+        assert_eq!(out, "plain content\n");
     }
 
     /// The variant-pair pattern: one emitted file picks one of two partials,
@@ -913,14 +828,8 @@ none
         const FILES: &[(&str, &str)] = &[
             // Partials carry `includefile false` so they are not emitted on
             // their own; that head directive must not leak into the caller.
-            (
-                "src/bin/main_async.rs",
-                "//%includefile false\nasync on {{ chip.name }}\n",
-            ),
-            (
-                "src/bin/main_blocking.rs",
-                "//%includefile false\nblocking\n",
-            ),
+            ("src/bin/main_async.rs", "async on {{ chip.name }}\n"),
+            ("src/bin/main_blocking.rs", "blocking\n"),
         ];
         let src = "\
 //%if option(\"embassy\")
@@ -934,16 +843,9 @@ none
 
         let render = |selected: &[&str]| {
             let selected: Vec<String> = selected.iter().map(|s| s.to_string()).collect();
-            process_file(
-                src,
-                &selected,
-                &[],
-                &facts,
-                &mut String::from("src/bin/main.rs"),
-                &mut partials(FILES),
-            )
-            .unwrap()
-            .unwrap()
+            Renderer::new(&selected, &[], &facts)
+                .render(src, &mut partials(FILES))
+                .unwrap()
         };
 
         assert_eq!(render(&["embassy"]), "async on esp32s3\n");
@@ -952,29 +854,17 @@ none
 
     #[test]
     fn an_include_cannot_escape_the_template_root() {
-        let err = process_file(
-            "//%include \"../../etc/passwd\"\n",
-            &[],
-            &[],
-            &Facts::default(),
-            &mut String::from("m.rs"),
-            &mut partials(&[]),
-        )
-        .expect_err("escaping include must be rejected");
+        let err = Renderer::new(&[], &[], &Facts::default())
+            .render("//%include \"../../etc/passwd\"\n", &mut partials(&[]))
+            .expect_err("escaping include must be rejected");
         assert!(err.message.contains("escapes the template root"), "{err}");
     }
 
     #[test]
     fn a_missing_partial_is_a_hard_error() {
-        let err = process_file(
-            "//%include \"nope.rs\"\n",
-            &[],
-            &[],
-            &Facts::default(),
-            &mut String::from("m.rs"),
-            &mut partials(&[]),
-        )
-        .expect_err("a missing partial must not render as empty");
+        let err = Renderer::new(&[], &[], &Facts::default())
+            .render("//%include \"nope.rs\"\n", &mut partials(&[]))
+            .expect_err("a missing partial must not render as empty");
         assert!(err.message.contains("nope.rs"), "{err}");
     }
 
@@ -988,23 +878,15 @@ none
         facts.set_value("project_name", "my-app");
 
         let src = "\
-#%includefile true
 ---
 expr: <% %>
 ---
 name: <% project_name %>
 run: cargo ${{ matrix.action.command }}
 ";
-        let out = process_file(
-            src,
-            &[],
-            &[],
-            &facts,
-            &mut String::from(".github/workflows/ci.yml"),
-            &mut no_partials(),
-        )
-        .unwrap()
-        .unwrap();
+        let out = Renderer::new(&[], &[], &facts)
+            .render(src, &mut no_partials())
+            .unwrap();
 
         // Frontmatter itself is consumed, ours is substituted, GitHub's is not.
         assert_eq!(
@@ -1014,12 +896,145 @@ run: cargo ${{ matrix.action.command }}
     }
 
     #[test]
-    fn includefile_excludes_the_whole_file() {
-        assert_eq!(process("#%includefile option(\"a\")\nbody\n", &[]), None);
+    fn a_manifest_condition_sees_the_same_facts_as_a_template_body() {
+        // The point of routing the manifest's `when` through the SDK: the
+        // binary owns *which* files exist, but the meaning of the condition is
+        // defined in exactly one place.
+        let facts = facts_with_chip();
+        let selected = vec!["wokwi".to_string()];
+        let groups = vec!["chip".to_string()];
+
+        let renderer = Renderer::new(&selected, &groups, &facts);
+        let eval = |cond: &str| renderer.evaluate(cond, "`when` condition").unwrap();
+
+        assert!(eval("option(\"wokwi\")"));
+        assert!(!eval("option(\"embassy\")"));
+        assert!(eval("group_selected(\"chip\")"));
+        assert!(eval("chip.xtensa"));
+        assert!(!eval("chip.riscv"));
+        assert!(eval("option(\"wokwi\") && !chip.riscv"));
+    }
+
+    #[test]
+    fn a_bad_manifest_condition_names_its_source() {
+        let facts = facts_with_chip();
+        let renderer = Renderer::new(&[], &[], &facts);
+        let err = renderer
+            .evaluate("chip.soc_has_wfi", "`emit.when` condition for `wokwi.toml`")
+            .expect_err("a mistyped field must not be silently false");
+
+        // The whole message, not a substring: the descriptor used to be spliced
+        // into a finished string by rewriting the first occurrence of the word
+        // "condition", which read badly and depended on wording this function
+        // does not own.
         assert_eq!(
-            process("#%includefile option(\"a\")\nbody\n", &["a"]),
-            Some("body\n".into())
+            err.message,
+            "invalid `emit.when` condition for `wokwi.toml` `chip.soc_has_wfi`: \
+             Struct `Chip` has no field `soc_has_wfi`"
         );
+    }
+
+    /// A manifest condition is not *in* a template file, so there is no line to
+    /// report — and `line 0:` would be worse than saying nothing.
+    #[test]
+    fn a_manifest_condition_error_carries_no_line() {
+        let facts = facts_with_chip();
+        let renderer = Renderer::new(&[], &[], &facts);
+        let err = renderer
+            .evaluate("chip.nope", "`emit.when` condition")
+            .unwrap_err();
+
+        assert_eq!(err.line, None);
+        assert!(
+            !err.to_string().starts_with("line "),
+            "rendered as {:?}",
+            err.to_string()
+        );
+
+        // A failure inside a file still points at one.
+        let in_file = process_err("#%if nope(\nx\n#%endif\n", &facts);
+        assert!(in_file.line.is_some());
+        assert!(in_file.to_string().starts_with("line "));
+    }
+
+    /// The context is reused across files, so the out-of-band unknown-name slot
+    /// must not carry a miss from one file into the next. A file that fails to
+    /// *compile* never reaches the point where the slot is taken.
+    #[test]
+    fn an_unknown_name_does_not_leak_between_files() {
+        let facts = facts_with_vocabulary();
+        let renderer = Renderer::new(&[], &[], &facts);
+
+        // Records an unknown option, then fails to compile before taking it.
+        let _ = renderer.render(
+            "#%if option(\"wifii\")\nx\n#%endif\n#%if\n",
+            &mut no_partials(),
+        );
+
+        // A clean file afterwards must render, not inherit the stale miss.
+        let out = renderer
+            .render("clean\n", &mut no_partials())
+            .expect("a stale unknown name leaked into the next file");
+        assert_eq!(out, "clean\n");
+    }
+
+    #[test]
+    fn an_output_path_interpolates_from_the_facts() {
+        let mut facts = Facts::default();
+        facts.set_value("coding_agent_guidance_file", "CLAUDE.md");
+        facts.set_value("chip", "esp32c6");
+
+        assert_eq!(
+            Renderer::new(&[], &[], &facts).output_path("{coding_agent_guidance_file}"),
+            "CLAUDE.md"
+        );
+        assert_eq!(
+            Renderer::new(&[], &[], &facts).output_path("src/{chip}.rs"),
+            "src/esp32c6.rs"
+        );
+        // Unknown names survive, matching the override-or-default idiom.
+        assert_eq!(
+            Renderer::new(&[], &[], &facts).output_path("src/{nope}.rs"),
+            "src/{nope}.rs"
+        );
+        assert_eq!(
+            Renderer::new(&[], &[], &facts).output_path("src/{unclosed.rs"),
+            "src/{unclosed.rs"
+        );
+    }
+
+    #[test]
+    fn an_interpolated_path_cannot_smuggle_an_escape() {
+        // The manifest is template-authored, so a value that expands to `..`
+        // must still be caught. `interpolate_path` substitutes; the caller
+        // checks — pinned together so the pairing isn't lost.
+        let mut facts = Facts::default();
+        facts.set_value("evil", "../../etc/passwd");
+
+        let path = Renderer::new(&[], &[], &facts).output_path("{evil}");
+        assert_eq!(path, "../../etc/passwd");
+        assert!(
+            !is_safe_relative_path(&path),
+            "an escaping expansion must fail the path check"
+        );
+    }
+
+    #[test]
+    fn path_interpolation_is_order_independent() {
+        // `values` is a `HashMap`; a single left-to-right pass is what stops
+        // the same manifest rendering two different paths across runs.
+        for _ in 0..64 {
+            let mut facts = Facts::default();
+            facts.set_value("outer", "{inner}");
+            facts.set_value("inner", "leaf");
+            facts.set_value("chip", "esp32c6");
+
+            // `{outer}` expands once; its `{inner}` is output, not re-expanded.
+            assert_eq!(
+                Renderer::new(&[], &[], &facts).output_path("src/{chip}/{outer}.rs"),
+                "src/esp32c6/{inner}.rs"
+            );
+        }
     }
 
     /// A chip whose fields cover both capabilities, only one of which it has.
@@ -1110,7 +1125,7 @@ has-bt
             &["esp32c6"],
             &["chip"],
         );
-        assert_eq!(out.unwrap(), "chip-picked\n");
+        assert_eq!(out, "chip-picked\n");
     }
 
     #[test]
@@ -1135,8 +1150,7 @@ claude-group-hit
 ",
             &["claude"],
             &["coding-agent-guidance"],
-        )
-        .unwrap();
+        );
         assert_eq!(out, "group-hit\nclaude-hit\n");
     }
 
@@ -1215,37 +1229,6 @@ big-dram2
     }
 
     #[test]
-    fn include_as_rejects_escaping_paths() {
-        let mut facts = Facts::default();
-        facts.set_value("evil", "../../etc/passwd");
-
-        for bad in [
-            "#%include_as /etc/passwd\nx\n",
-            "#%include_as ../outside.rs\nx\n",
-            "#%include_as ../../etc/passwd\nx\n",
-            "#%include_as sub/../../escape.rs\nx\n",
-            "#%include_as {evil}\nx\n", // interpolation must not smuggle an escape
-        ] {
-            let err = process_err(bad, &facts);
-            assert_eq!(err.line, 1, "{bad:?}");
-            assert!(err.message.contains("escapes the target"), "{err}");
-        }
-
-        // A contained path with an interior `.` is fine.
-        let mut path = String::from("orig.rs");
-        process_file(
-            "#%include_as ./src/a.rs\nx\n",
-            &[],
-            &[],
-            &facts,
-            &mut path,
-            &mut no_partials(),
-        )
-        .expect("contained path is allowed");
-        assert_eq!(path, "./src/a.rs");
-    }
-
-    #[test]
     fn is_safe_relative_path_classifies() {
         assert!(is_safe_relative_path("src/main.rs"));
         assert!(is_safe_relative_path("./a/b.rs"));
@@ -1257,47 +1240,6 @@ big-dram2
         assert!(!is_safe_relative_path("C:foo"));
         assert!(!is_safe_relative_path("C:\\foo"));
         assert!(!is_safe_relative_path("z:"));
-    }
-
-    #[test]
-    fn include_as_interpolation_is_order_independent() {
-        for _ in 0..64 {
-            let mut facts = Facts::default();
-            facts.set_value("outer", "{inner}");
-            facts.set_value("inner", "leaf");
-            facts.set_value("chip", "esp32c6");
-
-            let mut path = String::from("orig.rs");
-            process_file(
-                "#%include_as src/{chip}/{outer}.rs\nx\n",
-                &[],
-                &[],
-                &facts,
-                &mut path,
-                &mut no_partials(),
-            )
-            .unwrap();
-            // `{outer}` expands once; its `{inner}` is output, not re-expanded.
-            assert_eq!(path, "src/esp32c6/{inner}.rs");
-        }
-    }
-
-    #[test]
-    fn include_as_keeps_unknown_placeholders_verbatim() {
-        let mut facts = Facts::default();
-        facts.set_value("chip", "esp32c6");
-
-        let mut path = String::from("orig.rs");
-        process_file(
-            "#%include_as src/{chip}/{nope}/{unclosed.rs\nx\n",
-            &[],
-            &[],
-            &facts,
-            &mut path,
-            &mut no_partials(),
-        )
-        .unwrap();
-        assert_eq!(path, "src/esp32c6/{nope}/{unclosed.rs");
     }
 
     /// Facts carrying the option/group vocabularies that back the unknown-name
@@ -1342,7 +1284,6 @@ big-dram2
         let facts = facts_with_vocabulary();
 
         for template in [
-            "#%includefile option(\"nope\")\nx\n",
             "#%if option(\"nope\")\nx\n#%endif\n",
             "#%if option(\"alloc\")\nx\n#%else if option(\"nope\")\ny\n#%endif\n",
         ] {
@@ -1370,15 +1311,7 @@ big-dram2
         // A miss inside a *skipped* branch is never evaluated, so it must not
         // surface later and misattribute the error to an innocent line.
         let facts = facts_with_vocabulary();
-        let out = process_file(
-            "#%if option(\"alloc\")\nkept\n#%else\n#%if option(\"bogus\")\nx\n#%endif\n#%endif\n",
-            &["alloc".to_string()],
-            &[],
-            &facts,
-            &mut String::from("m.rs"),
-            &mut no_partials(),
-        )
-        .unwrap()
+        let out = Renderer::new(&["alloc".to_string()], &[], &facts).render("#%if option(\"alloc\")\nkept\n#%else\n#%if option(\"bogus\")\nx\n#%endif\n#%endif\n", &mut no_partials())
         .unwrap();
         assert_eq!(out, "kept\n");
     }
@@ -1396,25 +1329,17 @@ big-dram2
         let out = process_facts("let s = \"héllo → wörld 日本語 🦀\";\n", &facts);
         assert_eq!(out, "let s = \"héllo → wörld 日本語 🦀\";\n");
 
-        // Multi-byte text directly adjacent to `include_as` braces.
-        let mut path = String::from("orig.rs");
-        process_file(
-            "#%include_as src/日本{chip}語/{emoji}.rs\nx\n",
-            &[],
-            &[],
-            &facts,
-            &mut path,
-            &mut no_partials(),
-        )
-        .unwrap();
-        assert_eq!(path, "src/日本esp32c6語/🦀.rs");
+        // Multi-byte text directly adjacent to output-path braces.
+        assert_eq!(
+            Renderer::new(&[], &[], &facts).output_path("src/日本{chip}語/{emoji}.rs"),
+            "src/日本esp32c6語/🦀.rs"
+        );
 
         // And a non-ASCII string literal inside a condition.
         let out = process(
             "#%if option(\"öpt\")\nhit\n#%else\nmiss\n#%endif\n",
             &["öpt"],
-        )
-        .unwrap();
+        );
         assert_eq!(out, "hit\n");
     }
 
@@ -1422,32 +1347,19 @@ big-dram2
     fn leading_byte_order_mark_does_not_hide_directives() {
         // Editors on Windows happily write a UTF-8 BOM. U+FEFF is *not*
         // `char::is_whitespace`, so `trim()` leaves it attached to the first
-        // directive — which would silently demote `includefile` to literal
-        // text, emitting a file that should have been skipped.
-        let out = process_file(
-            "\u{feff}#%includefile false\nbody\n",
-            &[],
-            &[],
-            &Facts::default(),
-            &mut String::from("m.rs"),
-            &mut no_partials(),
-        )
-        .unwrap();
-        assert_eq!(out, None, "BOM hid the `includefile`");
+        // directive — which would demote it to literal text and corrupt the
+        // first token of the generated file.
 
-        // Same for a block directive on the first line.
-        let out = process("\u{feff}#%if option(\"x\")\nbody\n#%endif\n", &[]).unwrap();
+        // A block directive on the first line.
+        let out = process("\u{feff}#%if option(\"x\")\nbody\n#%endif\n", &[]);
         assert_eq!(out, "", "BOM hid the `if`");
 
         // A BOM ahead of ordinary content is stripped, not emitted: it would
         // otherwise corrupt the first token of a generated Rust/TOML file.
-        assert_eq!(
-            process("\u{feff}fn main() {}\n", &[]).unwrap(),
-            "fn main() {}\n"
-        );
+        assert_eq!(process("\u{feff}fn main() {}\n", &[]), "fn main() {}\n");
 
         // Only the file-leading one is a BOM; mid-file U+FEFF is content.
-        assert_eq!(process("a\u{feff}b\n", &[]).unwrap(), "a\u{feff}b\n");
+        assert_eq!(process("a\u{feff}b\n", &[]), "a\u{feff}b\n");
     }
 
     #[test]
@@ -1485,8 +1397,8 @@ big-dram2
         // an error. Pinned because losing it would silently degrade every
         // large template into unreadable directive soup.
         let src = "#%if option(\"a\")\nx\n#%endif a || b\n";
-        assert_eq!(process(src, &["a"]).unwrap(), "x\n");
-        assert_eq!(process(src, &[]).unwrap(), "");
+        assert_eq!(process(src, &["a"]), "x\n");
+        assert_eq!(process(src, &[]), "");
 
         // `else` is the exception: it has a meaningful continuation (`else
         // if`), so it parses strictly and a label is a hard error rather than
@@ -1499,7 +1411,7 @@ big-dram2
             err.message.contains("after `else`"),
             "expected a clear diagnostic, got: {err}"
         );
-        assert_eq!(err.line, 3);
+        assert_eq!(err.line, Some(3));
     }
 
     #[test]
@@ -1510,7 +1422,7 @@ big-dram2
             "#%if option(\"x\")\nbody\n",
         ] {
             let err = process_err(bad, &Facts::default());
-            assert!(err.line >= 1, "{bad:?} -> {err}");
+            assert!(err.line.is_some(), "{bad:?} -> {err}");
         }
     }
 
@@ -1545,17 +1457,10 @@ big-dram2
         let mut facts = Facts::default();
         facts.set_value("coding-agent-guidance-file", "CLAUDE.md");
 
-        let mut path = String::from("x.md");
-        process_file(
-            "#%include_as {coding-agent-guidance-file}\nx\n",
-            &[],
-            &[],
-            &facts,
-            &mut path,
-            &mut no_partials(),
-        )
-        .unwrap();
-        assert_eq!(path, "CLAUDE.md");
+        assert_eq!(
+            Renderer::new(&[], &[], &facts).output_path("{coding-agent-guidance-file}"),
+            "CLAUDE.md"
+        );
 
         // Referencing it from an expression is a hard error, not a silent false.
         let err = process_err("#%if coding-agent-guidance-file\nx\n#%endif\n", &facts);

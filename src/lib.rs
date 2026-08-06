@@ -5,9 +5,12 @@ use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use strum::IntoEnumIterator;
 
+pub mod builtin;
 pub mod cargo;
+pub mod source;
 
 pub use esp_template_sdk::{config, contract, process, template};
+pub use source::TemplateSource;
 
 /// Build-script-generated `TEMPLATE_FILES` array mapping each file under
 /// `template/` to its baked-in contents. Kept `pub` so xtask (and any other
@@ -66,6 +69,41 @@ impl Chip {
 
     pub fn pins(self) -> &'static [PinInfo] {
         self.metadata().pins()
+    }
+
+    /// The chip's name as a person writes it.
+    ///
+    /// Not derivable from the variant: `Esp32c61` is "ESP32-C61", and the
+    /// hyphenation doesn't follow from the kebab-case option name either.
+    pub fn display_name(self) -> &'static str {
+        match self {
+            Chip::Esp32 => "ESP32",
+            Chip::Esp32c2 => "ESP32-C2",
+            Chip::Esp32c3 => "ESP32-C3",
+            Chip::Esp32c5 => "ESP32-C5",
+            Chip::Esp32c6 => "ESP32-C6",
+            Chip::Esp32c61 => "ESP32-C61",
+            Chip::Esp32h2 => "ESP32-H2",
+            Chip::Esp32s2 => "ESP32-S2",
+            Chip::Esp32s3 => "ESP32-S3",
+        }
+    }
+
+    /// The Wokwi board this chip simulates as, if Wokwi supports it.
+    ///
+    /// Wokwi support is not a chip *capability* — it's a property of an
+    /// external simulator — so it can't come from `esp-metadata`. It rides
+    /// along with the chip because it is keyed by chip and nothing else.
+    pub fn wokwi_board(self) -> Option<&'static str> {
+        match self {
+            Chip::Esp32 => Some("board-esp32-devkit-c-v4"),
+            Chip::Esp32c3 => Some("board-esp32-c3-devkitm-1"),
+            Chip::Esp32c6 => Some("board-esp32-c6-devkitc-1"),
+            Chip::Esp32h2 => Some("board-esp32-h2-devkitm-1"),
+            Chip::Esp32s2 => Some("board-esp32-s2-devkitm-1"),
+            Chip::Esp32s3 => Some("board-esp32-s3-devkitc-1"),
+            Chip::Esp32c2 | Chip::Esp32c5 | Chip::Esp32c61 => None,
+        }
     }
 
     /// The chip-derived half of [`process::Facts`]: everything that depends on

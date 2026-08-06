@@ -5,4 +5,4 @@ pub mod contract;
 pub mod process;
 pub mod template;
 
-pub use process::{Facts, ProcessError, is_safe_relative_path, process_file};
+pub use process::{Facts, ProcessError, Renderer, is_safe_relative_path};

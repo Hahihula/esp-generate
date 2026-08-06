@@ -1,0 +1,78 @@
+# The esp-generate template manifest.
+#
+# Read by the binary before the SDK runs; `template.yaml` (the option tree) is
+# read by the SDK. The split is the parse boundary: this file decides *which*
+# files a generated project gets, the SDK decides what is *in* them.
+
+# The `esp-template-sdk` version this template is written against. The binary
+# refuses a template outside its compatibility range — the major carries
+# breaking contract changes, the minor additive ones (below 1.0 the minor plays
+# the major's role, per Cargo's caret rules).
+sdk_version = "0.1.0"
+
+name = "esp-generate default template"
+description = "no_std applications for Espressif SoCs"
+
+# Files whose emission is conditional, or whose output path differs from their
+# source path. Anything not listed here is emitted as-is; anything under
+# `.template/` is never emitted at all, which is where partials and the option
+# tree's `!Include` fragments live.
+#
+# `when` is a somni expression evaluated against the same facts a template body
+# sees, so `option("wokwi")` means exactly what it means inside a file.
+
+[[emit]]
+path = "wokwi.toml"
+when = 'option("wokwi")'
+
+[[emit]]
+path = "diagram.json"
+when = 'option("wokwi")'
+
+[[emit]]
+path = ".github/workflows/rust_ci.yml"
+when = 'option("ci")'
+
+[[emit]]
+path = "tests/hello_test.rs"
+when = 'option("embedded-test")'
+
+# Editor integration. These are dotfiles, which is exactly why they are easy to
+# miss when auditing a template by eye — the manifest is the one place that
+# lists them.
+
+[[emit]]
+path = ".helix/languages.toml"
+when = 'option("helix")'
+
+[[emit]]
+path = ".nvim.lua"
+when = 'group_selected("neovim")'
+
+[[emit]]
+path = ".vscode/extensions.json"
+when = 'option("vscode")'
+
+[[emit]]
+path = ".vscode/launch.json"
+when = 'option("vscode")'
+
+[[emit]]
+path = ".vscode/settings.json"
+when = 'option("vscode")'
+
+[[emit]]
+path = ".vscode/tasks.json"
+when = 'option("vscode")'
+
+[[emit]]
+path = ".zed/settings.json"
+when = 'option("zed")'
+
+# `as` names the output path. `{name}` is a literal lookup into the facts, not
+# an expression, so substitution-only keys may contain characters an identifier
+# cannot.
+[[emit]]
+path = "CODING_AGENT_GUIDANCE.md"
+when = 'group_selected("coding-agent-guidance")'
+as = "{coding_agent_guidance_file}"

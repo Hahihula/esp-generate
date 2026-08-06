@@ -7,7 +7,7 @@ clap       = { version = "4.6.1", features = ["derive"] }
 env_logger = "0.11.8"
 indexmap   = { version = "2.13.0", features = ["serde"] }
 log        = "0.4.29"
-semver     = "1.0.28"
+semver     = { version = "1.0.28", features = ["serde"] }
 serde      = { version = "1.0.228", features = ["derive"] }
 serde_yaml = "0.9.33"
 
@@ -54,6 +54,7 @@ serde.workspace = true
 serde_yaml.workspace = true
 toml_edit       = "0.25.11+spec-1.1.0"
 indexmap.workspace = true
+toml = { version = "0.9", default-features = false, features = ["parse", "serde"] }
 
 [build-dependencies]
 quote   = "1.0.45"

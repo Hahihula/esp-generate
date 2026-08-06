@@ -26,32 +26,82 @@ use std::{
 };
 use taplo::formatter::Options;
 
-use esp_generate::template_files::TEMPLATE_FILES;
+use esp_generate::{TemplateSource, builtin};
 
 mod check;
 mod chip_selector;
+mod manifest;
 mod toolchain;
 mod tui;
 
+/// The template being generated from. One day a CLI flag; for now the only
+/// source there is.
+const SOURCE: TemplateSource = TemplateSource::Bundled;
+
+/// Resolve an option-tree `!Include`, from the binary or from the template.
+///
+/// `builtin:` wins, so a template cannot shadow a binary-provided fragment with
+/// a file of the same name.
+fn load_include(path: &str) -> Option<String> {
+    builtin::resolve(path).or_else(|| SOURCE.get(path).map(str::to_string))
+}
+
+/// Whether any selected option declares `requires_nightly`.
+///
+/// Read from the option tree rather than sniffed from a known option name:
+/// which options need nightly is the *template's* to say, and a template we
+/// don't ship can't be name-sniffed at all.
+///
+/// Xtensa is exempt because its toolchain is `esp` — a fork that already
+/// carries what nightly would provide, and for which no nightly channel exists
+/// to filter down to.
+fn requires_nightly(
+    selected: &[String],
+    flat_options: &[GeneratorOption],
+    chip: Option<Chip>,
+) -> bool {
+    if chip.is_some_and(|c| c.metadata().is_xtensa()) {
+        return false;
+    }
+
+    selected
+        .iter()
+        .any(|name| find_option(name, flat_options).is_some_and(|(_, opt)| opt.requires_nightly))
+}
+
+/// The template's manifest — which files are emitted, and the SDK version gate.
+///
+/// Read before anything else touches the template, so an incompatible template
+/// fails with one line rather than an unknown-fact error part-way through
+/// generation.
+static MANIFEST: LazyLock<manifest::Manifest> = LazyLock::new(|| {
+    let source = SOURCE
+        .get(manifest::MANIFEST_PATH)
+        .unwrap_or_else(|| panic!("bundled template missing `{}`", manifest::MANIFEST_PATH));
+
+    let manifest =
+        manifest::Manifest::parse(source).expect("invalid manifest in the bundled template");
+    manifest
+        .validate_paths(|path| SOURCE.get(path).is_some())
+        .expect("bundled manifest refers to a file that isn't there");
+    manifest
+});
+
 static TEMPLATE: LazyLock<Template> = LazyLock::new(|| {
     // Load `template.yaml` as the root and resolve every `!Include <path>`
-    // against the bundled `TEMPLATE_FILES` table. This is the one place
-    // that knows how include paths map onto real files; the rest of the
-    // generator sees an already-flattened tree.
-    let root_yaml = TEMPLATE_FILES
-        .iter()
-        .find_map(|(k, v)| (*k == "template.yaml").then_some(*v))
+    // through the source. This is the one place that knows how include paths
+    // map onto real files; the rest of the generator sees an already-flattened
+    // tree.
+    let root_yaml = SOURCE
+        .get("template.yaml")
         .expect("bundled templates missing template.yaml");
 
-    let template = Template::load(root_yaml, |path| {
-        TEMPLATE_FILES
-            .iter()
-            .find_map(|(k, v)| (*k == path).then(|| v.to_string()))
-    })
-    .expect("failed to load bundled template");
+    let template =
+        Template::load(root_yaml, load_include).expect("failed to load bundled template");
 
-    // The `chip` category is authored in YAML but must stay aligned with the
-    // `Chip` enum for the generator to work.
+    // A template may hand-author a narrower `chip` category instead of taking
+    // `builtin:chip` — a board-specific template offering only its own chip.
+    // That path still has to name chips this binary knows.
     chip_selector::validate_chip_category(&template.options)
         .expect("invalid `chip` category in bundled template");
     template
@@ -317,11 +367,9 @@ fn about() -> String {
     );
 
     let toml = cargo::CargoToml::load(
-        TEMPLATE_FILES
-            .iter()
-            .find(|(k, _)| *k == "Cargo.toml")
-            .expect("Cargo.toml not found in template")
-            .1,
+        SOURCE
+            .get("Cargo.toml")
+            .expect("Cargo.toml not found in template"),
     )
     .expect("Failed to read Cargo.toml");
 
@@ -422,11 +470,9 @@ fn main() -> Result<()> {
     }
 
     let versions = cargo::CargoToml::load(
-        TEMPLATE_FILES
-            .iter()
-            .find(|(k, _)| *k == "Cargo.toml")
-            .expect("Cargo.toml not found in template")
-            .1,
+        SOURCE
+            .get("Cargo.toml")
+            .expect("Cargo.toml not found in template"),
     )
     .expect("Failed to read Cargo.toml");
 
@@ -531,6 +577,7 @@ fn main() -> Result<()> {
         let mut scan_finished = toolchain_scan.is_none();
         let mut populated_compat: Option<HashMap<String, String>> = None;
         let mut populated_with_scan = scan_finished;
+        let mut populated_nightly: Option<bool> = None;
 
         while running {
             if let Some(scan) = toolchain_scan.as_mut() {
@@ -571,13 +618,26 @@ fn main() -> Result<()> {
             let signature_changed = populated_compat.as_ref() != Some(&current_compat);
             let scan_needs_reflecting = scan_finished && !populated_with_scan;
 
-            if signature_changed || scan_needs_reflecting {
-                let chip = chip_from_name(group_pick(&current_compat, "chip"));
+            // `requires_nightly` narrows the toolchain list, but the option
+            // declaring it need not be in any selection group — the bundled
+            // `stack-smashing-protection` isn't — so toggling it leaves the
+            // compat signature untouched. Watched separately, or the picker
+            // would keep offering stable after the user asks for nightly.
+            let current_chip = chip_from_name(group_pick(&current_compat, "chip"));
+            let current_nightly = requires_nightly(
+                &app.selected_options(),
+                &app.repository.config.flat_options,
+                current_chip,
+            );
+            let nightly_changed = populated_nightly != Some(current_nightly);
+
+            if signature_changed || scan_needs_reflecting || nightly_changed {
+                let chip = current_chip;
 
                 let filtered = toolchain::toolchains_for_chip(
                     &cached_toolchains,
                     chip,
-                    &msrv,
+                    current_nightly,
                     args.toolchain.as_deref(),
                 );
                 for warning in &filtered.warnings {
@@ -602,6 +662,7 @@ fn main() -> Result<()> {
                         .compatibility_signature(&compat_groups),
                 );
                 populated_with_scan = scan_finished;
+                populated_nightly = Some(current_nightly);
             }
 
             // draw a frame
@@ -792,8 +853,7 @@ fn main() -> Result<()> {
             chip.metadata(),
             selected.contains(&"probe-rs".to_string()),
             msrv,
-            selected.contains(&"stack-smashing-protection".to_string())
-                && !chip.metadata().is_xtensa(),
+            requires_nightly(&selected, &flat_options, Some(chip)),
             args.headless,
             selected_toolchain.as_deref(),
         );
@@ -823,33 +883,41 @@ fn main() -> Result<()> {
 
     fs::create_dir(&project_dir)?;
 
-    // Resolves `include` paths against the bundled template table. Paths are
-    // template-root-relative, so this is the same key space `TEMPLATE_FILES`
-    // uses and an unknown path simply has no entry.
-    let mut load_partial = |path: &str| -> Result<String, String> {
-        TEMPLATE_FILES
-            .iter()
-            .find_map(|(k, v)| (*k == path).then(|| v.to_string()))
-            .ok_or_else(|| format!("no template file `{path}`"))
-    };
+    // Resolves `include` paths against the template source. Paths are
+    // template-root-relative, the same key space the source is indexed by.
+    let mut load_partial = |path: &str| SOURCE.read(path).map(str::to_string);
 
-    for &(source_path, contents) in TEMPLATE_FILES.iter() {
-        let mut out_path = source_path.to_string();
-        let processed = process::process_file(
-            contents,
-            &selected,
-            &selected_groups,
-            &facts,
-            &mut out_path,
-            &mut load_partial,
-        )
-        .map_err(|e| anyhow::anyhow!("{source_path}:{e}"))?;
-        let Some(processed) = processed else {
-            continue; // excluded by `includefile`
+    // Built once for the whole run: the selections and facts are the same for
+    // every file and every manifest condition, and the chip's fact map is not
+    // cheap to copy.
+    let renderer = process::Renderer::new(&selected, &selected_groups, &facts);
+
+    for (source_path, contents) in SOURCE.files() {
+        // Which files exist is the manifest's call, decided before the file is
+        // even read: template machinery and unselected features never reach the
+        // renderer at all.
+        let manifest::Emit::When { condition, output } = MANIFEST.emit(source_path) else {
+            continue;
+        };
+        if let Some(condition) = &condition {
+            let what = format!("`emit.when` condition for `{source_path}`");
+            if !renderer.evaluate(condition, &what)? {
+                continue;
+            }
+        }
+
+        let processed = renderer
+            .render(contents, &mut load_partial)
+            .map_err(|e| anyhow::anyhow!("{source_path}:{e}"))?;
+
+        let out_path = match &output {
+            Some(path) => renderer.output_path(path),
+            None => source_path.to_string(),
         };
 
-        // Reject any output path that escapes the project dir, even after
-        // the SDK already validates `#INCLUDE_AS` paths.
+        // The manifest is template-authored, so an output path is checked the
+        // same way an `include` path is — a rename must not walk out of the
+        // project directory.
         if !process::is_safe_relative_path(&out_path) {
             bail!("template file `{source_path}` resolved to unsafe output path `{out_path}`");
         }
@@ -1152,6 +1220,7 @@ fn should_initialize_git_repo(mut path: &Path) -> bool {
 #[cfg(test)]
 mod test {
     use esp_generate::config::flatten_options;
+    use strum::IntoEnumIterator;
 
     use super::*;
 
@@ -1192,6 +1261,162 @@ mod test {
         );
 
         assert_eq!(chip_from_name(group_pick(&signature, "chip")), None);
+    }
+
+    /// The bundled manifest and the bundled files must agree. Loading
+    /// `MANIFEST` runs the same check, but only when the binary actually
+    /// generates — this makes a rename that outdates a rule fail `cargo test`.
+    #[test]
+    fn the_bundled_manifest_matches_the_bundled_files() {
+        LazyLock::force(&MANIFEST);
+    }
+
+    /// Machinery must not leak into a generated project. The reserved directory
+    /// is the whole reason partials need no per-file marker, so if that rule
+    /// ever stopped applying every partial would be emitted as a source file.
+    #[test]
+    fn no_template_machinery_is_emitted() {
+        for (path, _) in SOURCE.files() {
+            let machinery = path == manifest::MANIFEST_PATH
+                || path == "template.yaml"
+                || path.starts_with(manifest::RESERVED_DIR);
+
+            assert_eq!(
+                MANIFEST.emit(path) == manifest::Emit::Never,
+                machinery,
+                "`{path}` is emitted iff it is not template machinery"
+            );
+        }
+    }
+
+    /// Selection groups whose options the *binary* supplies at runtime rather
+    /// than the template naming them, so they are picked with a dedicated flag
+    /// instead of `-o`.
+    const NOT_DASH_O: &[&str] = &["toolchain"];
+
+    /// Everything about an option that changes what selecting it *does*.
+    ///
+    /// Deliberately excludes `display_name` and `help`: the two bundled
+    /// `probe-rs` entries carry different help text, which is presentation, not
+    /// behaviour. `compatible` is excluded too — it decides which variant
+    /// survives pruning, so by the time we compare, it has already been applied.
+    #[derive(Debug, PartialEq)]
+    struct SelectionBehaviour<'a> {
+        selection_group: &'a str,
+        requires: &'a [String],
+        requires_capabilities: &'a [String],
+        requires_nightly: bool,
+        sets: Vec<(&'a str, &'a SetValue)>,
+    }
+
+    impl<'a> SelectionBehaviour<'a> {
+        fn of(option: &'a GeneratorOption) -> Self {
+            Self {
+                selection_group: &option.selection_group,
+                requires: &option.requires,
+                requires_capabilities: &option.requires_capabilities,
+                requires_nightly: option.requires_nightly,
+                sets: option.sets.iter().map(|(k, v)| (k.as_str(), v)).collect(),
+            }
+        }
+    }
+
+    /// Every option a user can select in the TUI must be expressible on the
+    /// command line, or the two front ends drift and a TUI-only feature quietly
+    /// becomes unreachable for scripts and for the xtask matrix.
+    ///
+    /// `-o <name>` resolves to the *first* option with that name, so a name
+    /// appearing twice is only safe while both entries behave identically. The
+    /// bundled template has two of each kind, and both are fine:
+    ///
+    /// * `probe-rs` — disjoint `compatible: { chip: … }`, so pruning leaves
+    ///   exactly one per chip;
+    /// * `defmt` — one per flashing category, kept apart at runtime by the
+    ///   categories' own `requires`, and otherwise identical.
+    ///
+    /// Two entries that *differed* would not be.
+    #[test]
+    fn every_selectable_option_is_expressible_as_dash_o() {
+        for chip in Chip::iter() {
+            let selections = HashMap::from([("chip".to_string(), chip.to_string())]);
+            let options = build_options(&selections, None, &[]);
+            let flat = flatten_options(&options);
+
+            let mut by_name: HashMap<&str, Vec<&GeneratorOption>> = HashMap::new();
+            for option in &flat {
+                if NOT_DASH_O.contains(&option.selection_group.as_str()) {
+                    continue;
+                }
+                assert!(
+                    !option.name.is_empty(),
+                    "{chip}: an option with no name cannot be selected with `-o`"
+                );
+                by_name
+                    .entry(option.name.as_str())
+                    .or_default()
+                    .push(option);
+            }
+
+            for (name, variants) in by_name {
+                let [first, rest @ ..] = variants.as_slice() else {
+                    unreachable!("every entry has at least one variant")
+                };
+                for other in rest {
+                    assert_eq!(
+                        SelectionBehaviour::of(first),
+                        SelectionBehaviour::of(other),
+                        "{chip}: `-o {name}` resolves to the first of several options that do \
+                         not behave the same, so the flag cannot express what the TUI can"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The exemption above must stay earned. If the toolchain group ever stops
+    /// carrying a name `-o` can't express, the entry is dead and the next
+    /// binary-populated group would inherit a blanket exemption it never
+    /// justified.
+    #[test]
+    fn the_dash_o_exemption_is_still_needed() {
+        let flat = flatten_options(&TEMPLATE.options);
+
+        for group in NOT_DASH_O {
+            let members: Vec<&str> = flat
+                .iter()
+                .filter(|o| o.selection_group == *group)
+                .map(|o| o.name.as_str())
+                .collect();
+
+            assert!(!members.is_empty(), "`{group}` has no options at all");
+            assert!(
+                members.iter().any(|name| name.is_empty()),
+                "`{group}` is exempt from `-o` parity, but every member is nameable: {members:?}"
+            );
+        }
+    }
+
+    /// The nightly requirement comes from the option tree, not from a known
+    /// option name — so a template we don't ship can express it too.
+    #[test]
+    fn the_nightly_requirement_is_read_from_the_option_tree() {
+        let flat = flatten_options(&TEMPLATE.options);
+        let ssp = vec!["stack-smashing-protection".to_string()];
+
+        assert!(
+            requires_nightly(&ssp, &flat, Some(Chip::Esp32c6)),
+            "the bundled template must declare `requires_nightly` on this option"
+        );
+        assert!(!requires_nightly(
+            &["alloc".to_string()],
+            &flat,
+            Some(Chip::Esp32c6)
+        ));
+        assert!(!requires_nightly(&[], &flat, Some(Chip::Esp32c6)));
+
+        // Xtensa is exempt: its toolchain is `esp`, and no nightly channel
+        // exists to narrow down to.
+        assert!(!requires_nightly(&ssp, &flat, Some(Chip::Esp32s3)));
     }
 
     #[test]

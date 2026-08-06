@@ -35,7 +35,7 @@ pub type CompatibilityRequirements = IndexMap<String, Vec<String>>;
 /// Keeping both shapes in one container means `sets` stays the sole
 /// mechanism for option-scoped data — no parallel fields on
 /// [`GeneratorOption`] for every new datum shape.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum SetValue {
     Scalar(String),

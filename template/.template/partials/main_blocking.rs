@@ -1,4 +1,3 @@
-//%includefile false
 #![no_std]
 #![no_main]
 #![deny(
