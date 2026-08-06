@@ -2,9 +2,9 @@
 -- You must enable the exrc setting in neovim for this config file to be used.
 local rust_analyzer = {
     cargo = {
-        target = "{{ rust_target }}",
+        target = "{{ chip.rust_target }}",
         allTargets = false,
-        --%if is_xtensa
+        --%if chip.xtensa
         --REPLACE esp rust_toolchain
         extraEnv = { RUSTUP_TOOLCHAIN = "esp" },
         --%endif
@@ -18,7 +18,7 @@ vim.lsp.config("rust-analyzer", {
 -- Note the neovim name of the language server is rust_analyzer with an underscore.
 vim.lsp.config("rust_analyzer", {
 --%endif
---%if is_xtensa
+--%if chip.xtensa
 	cmd = { "rustup", "run", "stable", "rust-analyzer" },
 --%endif
     settings = {

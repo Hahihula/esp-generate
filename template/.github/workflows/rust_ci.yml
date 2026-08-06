@@ -1,4 +1,9 @@
 #%includefile option("ci")
+---
+# GitHub Actions uses `${{ … }}`, which collides with the default `{{ … }}`
+# interpolation. Pick delimiters that cannot occur in a workflow file.
+expr: <% %>
+---
 name: Continuous Integration
 
 on:
@@ -12,7 +17,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-#%if is_xtensa
+#%if chip.xtensa
   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 #%endif
 
@@ -34,17 +39,17 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v6
       - name: Setup Rust
-#%if is_riscv
+#%if chip.riscv
         uses: dtolnay/rust-toolchain@v1
         with:
-          target: {{ rust_target }}
+          target: <% chip.rust_target %>
           toolchain: stable
           components: rust-src, rustfmt, clippy
-#%else if is_xtensa
+#%else if chip.xtensa
 #+        uses: esp-rs/xtensa-toolchain@v1.5
 #+        with:
 #+          default: true
-#+          buildtargets: {{ chip }}
+#+          buildtargets: <% chip.name %>
 #+          ldproxy: false
 #%endif
       - name: Enable caching

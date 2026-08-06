@@ -1,12 +1,12 @@
 [toolchain]
-#%if is_riscv
+#%if chip.riscv
 #%if option("stack-smashing-protection")
 #+channel    = "nightly"
 #%else
 channel    = "{{ rust_toolchain }}"
 #%endif
 components = ["rust-src"]
-targets = ["{{ rust_target }}"]
-#%else if is_xtensa
+targets = ["{{ chip.rust_target }}"]
+#%else if chip.xtensa
 #+channel = "{{ rust_toolchain }}"
 #%endif

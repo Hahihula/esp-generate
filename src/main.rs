@@ -24,7 +24,6 @@ use std::{
     sync::LazyLock,
     time::Duration,
 };
-use strum::IntoEnumIterator;
 use taplo::formatter::Options;
 
 use esp_generate::template_files::TEMPLATE_FILES;
@@ -689,12 +688,10 @@ fn main() -> Result<()> {
     let mut facts = chip.map(Chip::facts).unwrap_or_default();
 
     // The vocabularies behind the unknown-name hard error. Each is the set of
-    // names that could be true for *some* chip or selection, so a misspelling
-    // is distinguishable from a name that is simply not true right now.
-    facts.vocabulary.symbols = Chip::iter()
-        .flat_map(|c| c.metadata().all_symbols())
-        .map(|s| s.to_string())
-        .collect();
+    // names that could be true for *some* selection, so a misspelling is
+    // distinguishable from a name that is simply not true right now. Chip
+    // capabilities need no entry here: they are fields of the `chip` struct, so
+    // somni reports an unknown one itself, pointing at the source.
     facts.vocabulary.options = TEMPLATE
         .all_options()
         .iter()
@@ -725,7 +722,11 @@ fn main() -> Result<()> {
         // Interpolation has no such fallback, so the default lives here — where
         // the ISA is actually known. `set_value` keeps the first writer, so an
         // explicitly selected toolchain still wins.
-        let default_toolchain = if facts.is_xtensa { "esp" } else { "stable" };
+        let default_toolchain = if chip.metadata().is_xtensa() {
+            "esp"
+        } else {
+            "stable"
+        };
         facts.set_value("rust_toolchain", default_toolchain);
 
         let mut reserved_gpio_code = String::new();

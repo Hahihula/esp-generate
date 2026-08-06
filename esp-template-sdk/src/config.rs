@@ -1,7 +1,20 @@
 use std::collections::HashMap;
 
-use crate::process::Facts;
+use crate::process::{FactValue, Facts};
 use crate::template::{GeneratorOption, GeneratorOptionItem};
+
+/// Whether a chip field counts as "has this capability".
+///
+/// Boolean symbols say so directly; a string-valued symbol
+/// (`bt_controller = "npl"`) counts as present unless it is empty, which is how
+/// a chip that lacks it entirely is represented.
+fn is_truthy(value: &FactValue) -> bool {
+    match value {
+        FactValue::Bool(b) => *b,
+        FactValue::Str(s) => !s.is_empty(),
+        FactValue::Int(i) => *i != 0,
+    }
+}
 
 #[derive(Debug)]
 pub struct ActiveConfiguration {
@@ -481,8 +494,9 @@ impl ActiveConfiguration {
     /// an arbitrary selection set (used by [`Self::would_force_deselect`]).
     ///
     /// Two independent gates must hold: `compatible: { group: [...] }` allow-lists,
-    /// and `requires_capabilities` ⊆ `facts.symbols`. With `facts = None`, the
-    /// capability gate is unconstrained.
+    /// and every `requires_capabilities` entry being a chip field that is true.
+    /// With `facts = None` — or no chip picked — the capability gate is
+    /// unconstrained.
     fn is_option_compatible_against(
         option: &GeneratorOption,
         selected: &[usize],
@@ -499,9 +513,13 @@ impl ActiveConfiguration {
             }
         }
 
-        if let Some(facts) = facts {
+        if let Some(chip) = facts.and_then(|f| f.chip.as_ref()) {
             for cap in &option.requires_capabilities {
-                if !facts.symbols.contains(cap) {
+                // The chip carries a field for every symbol any chip declares,
+                // so an absent name is an unknown capability and a present-but-
+                // false one is a capability this chip lacks. Both fail the gate;
+                // `check` is what tells the author which of the two it was.
+                if !chip.get(cap).is_some_and(is_truthy) {
                     return false;
                 }
             }
@@ -1319,18 +1337,25 @@ mod test {
         active.select("wifi");
         assert!(active.is_selected("wifi"));
 
+        // Every chip carries a field for every symbol; only the value differs.
+        let chip_with = |has_wifi: bool| Facts {
+            chip: Some(IndexMap::from([
+                ("soc_has_wifi".to_string(), FactValue::Bool(has_wifi)),
+                ("soc_has_bt".to_string(), FactValue::Bool(true)),
+            ])),
+            ..Default::default()
+        };
+
         // A chip that HAS the symbol keeps it compatible and selected.
-        let mut with_wifi = Facts::default();
-        with_wifi.symbols.insert("soc_has_wifi".to_string());
-        active.set_facts(Some(with_wifi));
+        active.set_facts(Some(chip_with(true)));
         assert!(active.is_option_compatible(&wifi));
         assert!(active.is_selected("wifi"));
 
         // Switching to a chip that LACKS it makes the option incompatible and
         // cascades it out of the selection (mirrors a `compatible` mismatch).
-        let mut without_wifi = Facts::default();
-        without_wifi.symbols.insert("soc_has_bt".to_string());
-        active.set_facts(Some(without_wifi));
+        // The field is *present* and false — that is what lets a template's
+        // `chip.soc_has_wifi` be falsy rather than an unknown-field error.
+        active.set_facts(Some(chip_with(false)));
         assert!(!active.is_option_compatible(&wifi));
         assert!(
             !active.is_selected("wifi"),

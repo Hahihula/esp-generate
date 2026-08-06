@@ -31,7 +31,7 @@
 //! //%if option("wifi")
 //! //+let wifi = true;              // `//+` is stripped: emits `let wifi = true;`
 //! //%endif
-//! let chip = "{{ chip }}";
+//! let chip = "{{ chip.name }}";
 //! ```
 //!
 //! The `%` is load-bearing. With a bare `//` marker the engine would try to
@@ -55,14 +55,22 @@
 //!
 //! - `option(name)` — is that option selected?
 //! - `group_selected(group)` — does that selection group have a pick?
-//! - `chip_has(symbol)` — does the selected chip declare that metadata symbol?
-//! - `is_xtensa` / `is_riscv` — the selected chip's ISA.
 //! - `has_reserved_pins` — does the selected module reserve any GPIOs?
+//! - `chip` — a **struct** of everything derived from the selected chip:
+//!   `chip.name`, `chip.rust_target`, `chip.dram2_uninit_size`, and one field
+//!   per `esp-metadata` symbol (`chip.riscv`, `chip.soc_has_wifi`, and the
+//!   string-valued ones such as `chip.bt_controller`).
+//!
+//! Namespacing the chip replaces a `chip_has(symbol)` predicate and the
+//! purpose-picked `is_xtensa` / `is_riscv` flags. The gain is diagnostics:
+//! somni reports `chip.soc_has_wfi` as an unknown field of `Chip` and points
+//! at it in the source, where a predicate taking a string could only ever
+//! return `false` and leave the block it guards silently disabled.
 //!
 //! Every [`Facts::values`] entry whose name is a somni identifier is *also*
-//! registered as a value, so `{{ chip }}`, `#%if chip == "esp32c6"` and
-//! `#%if dram2_uninit_size > 0` all work. The predicates above are reserved: a
-//! template-scoped value can never shadow one.
+//! registered as a value, so `#%if dram2_uninit_size > 0` style comparisons
+//! work for non-chip facts too. Contract names are reserved: a template-scoped
+//! value can never shadow one.
 //!
 //! Interpolation emits strings, so an [`Int`](FactValue::Int) fact is written
 //! `{{ str(dram2_uninit_size) }}`; the bare form is a render-time type error.
@@ -80,7 +88,8 @@ use std::{
     rc::Rc,
 };
 
-use somni_template::{BlockStyle, Env, Syntax, Template};
+use indexmap::IndexMap;
+use somni_template::{BlockStyle, Env, SomniStruct, Syntax, Template, TypedValue};
 
 use crate::contract::is_reserved_name;
 
@@ -92,6 +101,7 @@ use crate::contract::is_reserved_name;
 pub enum FactValue {
     Str(String),
     Int(u64),
+    Bool(bool),
 }
 
 impl std::fmt::Display for FactValue {
@@ -99,7 +109,14 @@ impl std::fmt::Display for FactValue {
         match self {
             FactValue::Str(s) => f.write_str(s),
             FactValue::Int(i) => write!(f, "{i}"),
+            FactValue::Bool(b) => write!(f, "{b}"),
         }
+    }
+}
+
+impl From<bool> for FactValue {
+    fn from(value: bool) -> Self {
+        FactValue::Bool(value)
     }
 }
 
@@ -146,8 +163,6 @@ impl From<usize> for FactValue {
 /// `check`'s job to find statically.
 #[derive(Debug, Default, Clone)]
 pub struct Vocabulary {
-    /// Every capability name declared by any supported chip. Backs `chip_has`.
-    pub symbols: HashSet<String>,
     /// Every option name the template declares. Backs `option`.
     pub options: HashSet<String>,
     /// Every selection-group name the template declares. Backs `group_selected`.
@@ -159,17 +174,23 @@ pub struct Vocabulary {
 /// isn't a user selection.
 #[derive(Debug, Default, Clone)]
 pub struct Facts {
-    /// Metadata symbols the chip declares. Backs `chip_has(symbol)`.
-    pub symbols: HashSet<String>,
+    /// The selected chip, exposed to templates as the `chip` struct:
+    /// `chip.name`, `chip.riscv`, `chip.soc_has_wifi`, … `None` when no chip is
+    /// selected, in which case any `chip.…` reference is an error naming the
+    /// variable — which is the right answer for a template that needs one.
+    ///
+    /// The map must hold **every** field the template could reference, not just
+    /// the ones true for this chip: somni reports an unknown field as an error,
+    /// so a capability the chip merely lacks has to be present-and-`false`, or
+    /// a cross-chip `#%if chip.soc_has_wifi` would fail instead of taking its
+    /// else branch. Getting that union right is what buys the typo diagnostic —
+    /// `chip.soc_has_wfi` is then the *only* unknown name.
+    pub chip: Option<IndexMap<String, FactValue>>,
     /// Known-name vocabularies backing the unknown-name hard error.
     pub vocabulary: Vocabulary,
     /// Substitution values: spliced literally by `include_as`, and exposed to
     /// expressions as somni values when the name is an identifier.
     pub values: HashMap<String, FactValue>,
-    /// Whether the chip's ISA is Xtensa. Backs `is_xtensa`.
-    pub is_xtensa: bool,
-    /// Whether the chip's ISA is RISC-V. Backs `is_riscv`.
-    pub is_riscv: bool,
     /// Whether the selected module reserves any GPIOs. Backs `has_reserved_pins`.
     pub has_reserved_pins: bool,
 }
@@ -322,6 +343,7 @@ fn build_env(shared: &Rc<Shared>) -> Env {
         match value {
             FactValue::Str(s) => env.value(name, s.as_str()),
             FactValue::Int(i) => env.value(name, *i),
+            FactValue::Bool(b) => env.value(name, *b),
         };
     }
 
@@ -349,20 +371,23 @@ fn build_env(shared: &Rc<Shared>) -> Env {
         ctx.selected_groups.iter().any(|g| g == group)
     });
 
-    let ctx = shared.clone();
-    env.function("chip_has", move |symbol: &str| -> bool {
-        let vocab = &ctx.facts.vocabulary.symbols;
-        if !vocab.is_empty() && !vocab.contains(symbol) {
-            ctx.note_unknown(format!(
-                "unknown capability `{symbol}` — no supported chip declares it"
-            ));
-            return false;
-        }
-        ctx.facts.symbols.contains(symbol)
-    });
+    // The chip goes in last, so it wins over any template-scoped value that
+    // slipped past `is_reserved_name`.
+    if let Some(chip) = &shared.facts.chip {
+        let fields = chip
+            .iter()
+            .map(|(name, value)| {
+                let value = match value {
+                    FactValue::Str(s) => TypedValue::String(s.as_str().into()),
+                    FactValue::Int(i) => TypedValue::Int(*i),
+                    FactValue::Bool(b) => TypedValue::Bool(*b),
+                };
+                (name.as_str().into(), value)
+            })
+            .collect();
+        env.value("chip", SomniStruct::new("Chip".into(), fields));
+    }
 
-    env.value("is_xtensa", shared.facts.is_xtensa);
-    env.value("is_riscv", shared.facts.is_riscv);
     env.value("has_reserved_pins", shared.facts.has_reserved_pins);
 
     env
@@ -854,10 +879,10 @@ none
     #[test]
     fn interpolation_reads_facts_values() {
         let mut facts = Facts::default();
-        facts.set_value("chip", "esp32c6");
+        facts.set_value("project_name", "my-app");
         assert_eq!(
-            process_facts("features = [\"{{ chip }}\"]\n", &facts),
-            "features = [\"esp32c6\"]\n"
+            process_facts("name = \"{{ project_name }}\"\n", &facts),
+            "name = \"my-app\"\n"
         );
     }
 
@@ -890,7 +915,7 @@ none
             // their own; that head directive must not leak into the caller.
             (
                 "src/bin/main_async.rs",
-                "//%includefile false\nasync on {{ chip }}\n",
+                "//%includefile false\nasync on {{ chip.name }}\n",
             ),
             (
                 "src/bin/main_blocking.rs",
@@ -904,8 +929,8 @@ none
 //%include \"src/bin/main_blocking.rs\"
 //%endif
 ";
-        let mut facts = Facts::default();
-        facts.set_value("chip", "esp32c6");
+        // The partial shares the caller's facts, chip struct included.
+        let facts = facts_with_chip();
 
         let render = |selected: &[&str]| {
             let selected: Vec<String> = selected.iter().map(|s| s.to_string()).collect();
@@ -921,7 +946,7 @@ none
             .unwrap()
         };
 
-        assert_eq!(render(&["embassy"]), "async on esp32c6\n");
+        assert_eq!(render(&["embassy"]), "async on esp32s3\n");
         assert_eq!(render(&[]), "blocking\n");
     }
 
@@ -953,6 +978,41 @@ none
         assert!(err.message.contains("nope.rs"), "{err}");
     }
 
+    /// A file whose *content* legitimately contains `{{ … }}` — a GitHub
+    /// Actions workflow — declares its own delimiters in frontmatter. Without
+    /// this the bundled `rust_ci.yml` renders `${{ secrets.GITHUB_TOKEN }}` as
+    /// an interpolation and fails with "Variable secrets was not found".
+    #[test]
+    fn frontmatter_can_move_the_interpolation_delimiters() {
+        let mut facts = facts_with_chip();
+        facts.set_value("project_name", "my-app");
+
+        let src = "\
+#%includefile true
+---
+expr: <% %>
+---
+name: <% project_name %>
+run: cargo ${{ matrix.action.command }}
+";
+        let out = process_file(
+            src,
+            &[],
+            &[],
+            &facts,
+            &mut String::from(".github/workflows/ci.yml"),
+            &mut no_partials(),
+        )
+        .unwrap()
+        .unwrap();
+
+        // Frontmatter itself is consumed, ours is substituted, GitHub's is not.
+        assert_eq!(
+            out,
+            "name: my-app\nrun: cargo ${{ matrix.action.command }}\n"
+        );
+    }
+
     #[test]
     fn includefile_excludes_the_whole_file() {
         assert_eq!(process("#%includefile option(\"a\")\nbody\n", &[]), None);
@@ -962,31 +1022,85 @@ none
         );
     }
 
-    #[test]
-    fn chip_has_and_isa_predicates_drive_conditions() {
-        let mut facts = Facts::default();
-        facts.symbols.insert("soc_has_wifi".to_string());
-        facts.is_xtensa = true;
-        facts.is_riscv = false;
+    /// A chip whose fields cover both capabilities, only one of which it has.
+    fn facts_with_chip() -> Facts {
+        Facts {
+            chip: Some(IndexMap::from([
+                ("name".to_string(), FactValue::Str("esp32s3".into())),
+                ("xtensa".to_string(), FactValue::Bool(true)),
+                ("riscv".to_string(), FactValue::Bool(false)),
+                ("soc_has_wifi".to_string(), FactValue::Bool(true)),
+                ("soc_has_bt".to_string(), FactValue::Bool(false)),
+                ("bt_controller".to_string(), FactValue::Str(String::new())),
+                ("dram2_uninit_size".to_string(), FactValue::Int(65536)),
+            ])),
+            ..Default::default()
+        }
+    }
 
+    #[test]
+    fn chip_fields_drive_conditions() {
         let out = process_facts(
             "\
-#%if chip_has(\"soc_has_wifi\")
+#%if chip.soc_has_wifi
 has-wifi
 #%endif
-#%if is_xtensa
+#%if chip.xtensa
 xtensa
 #%endif
-#%if is_riscv
+#%if chip.riscv
 riscv
 #%endif
-#%if chip_has(\"soc_has_bt\")
+#%if chip.soc_has_bt
 has-bt
 #%endif
 ",
-            &facts,
+            &facts_with_chip(),
         );
         assert_eq!(out, "has-wifi\nxtensa\n");
+    }
+
+    #[test]
+    fn chip_fields_interpolate_by_type() {
+        let facts = facts_with_chip();
+        assert_eq!(process_facts("{{ chip.name }}\n", &facts), "esp32s3\n");
+        assert_eq!(
+            process_facts("{{ str(chip.dram2_uninit_size) }}\n", &facts),
+            "65536\n"
+        );
+    }
+
+    /// The reason the chip is a struct rather than a `chip_has(...)` predicate:
+    /// a mistyped capability is an error naming the field, where a predicate
+    /// taking a string could only return `false` and silently disable the block
+    /// it guards. The counterpart matters just as much — a capability the chip
+    /// *lacks* must stay falsy, which is why every field is present.
+    #[test]
+    fn a_mistyped_capability_is_an_error_but_an_absent_one_is_false() {
+        let facts = facts_with_chip();
+
+        let out = process_facts("#%if chip.soc_has_bt\nyes\n#%else\nno\n#%endif\n", &facts);
+        assert_eq!(out, "no\n", "an absent capability must stay falsy");
+
+        let err = process_err("#%if chip.soc_has_wfi\nx\n#%endif\n", &facts);
+        assert!(err.message.contains("soc_has_wfi"), "{err}");
+        assert!(err.message.contains("no field"), "{err}");
+    }
+
+    #[test]
+    fn a_template_value_cannot_shadow_the_chip_struct() {
+        let mut facts = facts_with_chip();
+        facts
+            .values
+            .insert("chip".to_string(), FactValue::Str("nonsense".into()));
+        assert_eq!(process_facts("{{ chip.name }}\n", &facts), "esp32s3\n");
+    }
+
+    #[test]
+    fn without_a_chip_the_namespace_does_not_exist() {
+        // Not silently false: a template that needs a chip should say so.
+        let err = process_err("#%if chip.riscv\nx\n#%endif\n", &Facts::default());
+        assert!(err.message.contains("chip"), "{err}");
     }
 
     #[test]
@@ -1028,16 +1142,15 @@ claude-group-hit
 
     #[test]
     fn values_are_readable_in_conditions() {
-        let mut facts = Facts::default();
-        facts.set_value("chip", "esp32c6");
+        let mut facts = facts_with_chip();
         facts.set_value("dram2_uninit_size", 1024u64);
 
         let out = process_facts(
             "\
-#%if chip == \"esp32c6\"
-is-c6
+#%if chip.name == \"esp32s3\"
+is-s3
 #%endif
-#%if chip == \"esp32\"
+#%if chip.name == \"esp32\"
 is-esp32
 #%endif
 #%if dram2_uninit_size > 0
@@ -1049,19 +1162,22 @@ big-dram2
 ",
             &facts,
         );
-        assert_eq!(out, "is-c6\nhas-dram2\n");
+        assert_eq!(out, "is-s3\nhas-dram2\n");
     }
 
     #[test]
     fn templates_cannot_shadow_reserved_facts() {
         // A `sets` key colliding with a binary predicate must not win.
         let facts = Facts {
-            is_xtensa: false,
-            values: HashMap::from([("is_xtensa".to_string(), FactValue::Str("yes".to_string()))]),
+            has_reserved_pins: false,
+            values: HashMap::from([(
+                "has_reserved_pins".to_string(),
+                FactValue::Str("yes".to_string()),
+            )]),
             ..Default::default()
         };
         let out = process_facts(
-            "#%if is_xtensa\nshadowed\n#%else\nreserved-wins\n#%endif\n",
+            "#%if has_reserved_pins\nshadowed\n#%else\nreserved-wins\n#%endif\n",
             &facts,
         );
         assert_eq!(out, "reserved-wins\n");
@@ -1184,13 +1300,12 @@ big-dram2
         assert_eq!(path, "src/esp32c6/{nope}/{unclosed.rs");
     }
 
-    /// Facts carrying a full vocabulary, plus one chip that has only
-    /// `soc_has_wifi` out of the two capabilities that exist.
+    /// Facts carrying the option/group vocabularies that back the unknown-name
+    /// error for the two string-argument predicates. Chip capabilities need no
+    /// vocabulary — they are struct fields, and somni reports an unknown one.
     fn facts_with_vocabulary() -> Facts {
         Facts {
-            symbols: HashSet::from(["soc_has_wifi".to_string()]),
             vocabulary: Vocabulary {
-                symbols: HashSet::from(["soc_has_wifi".to_string(), "soc_has_pcnt".to_string()]),
                 options: HashSet::from(["alloc".to_string(), "wifi".to_string()]),
                 groups: HashSet::from(["chip".to_string(), "flashing".to_string()]),
             },
@@ -1199,23 +1314,6 @@ big-dram2
     }
 
     #[test]
-    fn a_typo_is_distinguishable_from_an_absent_capability() {
-        let facts = facts_with_vocabulary();
-
-        // In the vocabulary but not this chip's set → plain `false`, which is
-        // the whole point of `chip_has`.
-        let out = process_facts(
-            "#%if chip_has(\"soc_has_pcnt\")\nyes\n#%else\nno\n#%endif\n",
-            &facts,
-        );
-        assert_eq!(out, "no\n", "an absent capability must stay falsy");
-
-        // Outside the vocabulary → author error, not a silent `false`.
-        let err = process_err("#%if chip_has(\"soc_has_wfi\")\nx\n#%endif\n", &facts);
-        assert!(err.message.contains("unknown capability"), "{err}");
-        assert!(err.message.contains("soc_has_wfi"), "{err}");
-    }
-
     #[test]
     fn unknown_option_and_group_names_are_hard_errors() {
         let facts = facts_with_vocabulary();
@@ -1244,13 +1342,13 @@ big-dram2
         let facts = facts_with_vocabulary();
 
         for template in [
-            "#%includefile chip_has(\"nope\")\nx\n",
-            "#%if chip_has(\"nope\")\nx\n#%endif\n",
-            "#%if option(\"alloc\")\nx\n#%else if chip_has(\"nope\")\ny\n#%endif\n",
+            "#%includefile option(\"nope\")\nx\n",
+            "#%if option(\"nope\")\nx\n#%endif\n",
+            "#%if option(\"alloc\")\nx\n#%else if option(\"nope\")\ny\n#%endif\n",
         ] {
             let err = process_err(template, &facts);
             assert!(
-                err.message.contains("unknown capability"),
+                err.message.contains("unknown option"),
                 "{template:?} -> {err}"
             );
         }
@@ -1261,7 +1359,7 @@ big-dram2
         // Consumers with no vocabulary to supply keep the permissive behaviour
         // rather than having every name rejected.
         let out = process_facts(
-            "#%if chip_has(\"anything\") || option(\"whatever\")\nyes\n#%else\nno\n#%endif\n",
+            "#%if option(\"whatever\")\nyes\n#%else\nno\n#%endif\n",
             &Facts::default(),
         );
         assert_eq!(out, "no\n");
@@ -1273,7 +1371,7 @@ big-dram2
         // surface later and misattribute the error to an innocent line.
         let facts = facts_with_vocabulary();
         let out = process_file(
-            "#%if option(\"alloc\")\nkept\n#%else\n#%if chip_has(\"bogus\")\nx\n#%endif\n#%endif\n",
+            "#%if option(\"alloc\")\nkept\n#%else\n#%if option(\"bogus\")\nx\n#%endif\n#%endif\n",
             &["alloc".to_string()],
             &[],
             &facts,

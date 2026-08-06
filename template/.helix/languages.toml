@@ -2,7 +2,7 @@
 [[language]]
 name = "rust"
 
-#%if is_xtensa
+#%if chip.xtensa
 [language-server.rust-analyzer]
 environment.RUSTUP_TOOLCHAIN = "stable"
 
@@ -11,7 +11,7 @@ environment.RUSTUP_TOOLCHAIN = "stable"
 cargo.allTargets = false
 #REPLACE riscv32imac-unknown-none-elf rust_target
 cargo.target = "riscv32imac-unknown-none-elf"
-#%if is_xtensa
+#%if chip.xtensa
 #REPLACE esp rust_toolchain
 cargo.extraEnv.RUSTUP_TOOLCHAIN = "esp"
 #%endif

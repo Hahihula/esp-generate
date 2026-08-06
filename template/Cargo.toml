@@ -20,7 +20,7 @@ test = false
 
 [dependencies]
 esp-hal = { version = "~1.1.0", features = [
-    "{{ chip }}",
+    "{{ chip.name }}",
     #%if option("unstable-hal")
     "unstable",
     #%endif
@@ -43,7 +43,7 @@ esp-rtos = { version = "0.3.0", features = [
     #%if option("embassy")
     "embassy",
     #%endif
-    "{{ chip }}",
+    "{{ chip.name }}",
     #%if option("defmt")
     #+    "defmt",
     #%endif
@@ -60,7 +60,7 @@ esp-bootloader-esp-idf = { version = "0.5.0", features = [
     #%if option("log")
     "log-04",
     #%endif
-    "{{ chip }}",
+    "{{ chip.name }}",
 ] }
 #%if option("defmt")
 #+defmt = "1.0.1"
@@ -77,7 +77,7 @@ rtt-target = { version = "0.6.2", features = ["defmt"] }
 #%endif defmt
 #%else
 esp-println = { version = "0.17.0", features = [
-    "{{ chip }}",
+    "{{ chip.name }}",
     #%if option("defmt")
     #+    "defmt-espflash",
     #%endif
@@ -89,7 +89,7 @@ esp-println = { version = "0.17.0", features = [
 #%endif log-frontend || panic-handler || probe-rs
 #%if option("esp-backtrace")
 esp-backtrace = { version = "0.19.0", features = [
-    "{{ chip }}",
+    "{{ chip.name }}",
     "panic-handler",
     #%if option("defmt")
     #+    "defmt",
@@ -160,7 +160,7 @@ smoltcp = { version = "0.13.0", default-features = false, features = [
 ] }
 #%endif wifi
 esp-radio = { version = "0.18.0", features = [
-    "{{ chip }}",
+    "{{ chip.name }}",
     #%if option("wifi")
     "wifi",
     #%endif
@@ -212,7 +212,7 @@ critical-section = "1.2.0"
 #%if option("embedded-test")
 [dev-dependencies]
 embedded-test = { version = "0.7.1", features = [
-    #%if is_xtensa
+    #%if chip.xtensa
     "xtensa-semihosting",
     #%endif
     #%if option("embassy")

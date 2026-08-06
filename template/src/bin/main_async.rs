@@ -102,7 +102,7 @@ async fn main(spawner: Spawner) -> ! {
     {{ reserved_gpio_code }}
 
     //%if option("alloc")
-    esp_alloc::heap_allocator!(#[esp_hal::ram(reclaimed)] size: {{ str(dram2_uninit_size) }});
+    esp_alloc::heap_allocator!(#[esp_hal::ram(reclaimed)] size: {{ str(chip.dram2_uninit_size) }});
     //%if option("wifi") && option("ble-trouble")
     // COEX needs more RAM - so we've added some more
     esp_alloc::heap_allocator!(size: 64 * 1024);

@@ -66,8 +66,14 @@ pub enum FeatureKind {
     /// A somni predicate callable from a template condition (e.g. `chip_has`).
     Predicate,
     /// A binary-provided value a template can interpolate or test against
-    /// (e.g. `chip`, `reserved_gpio_code`).
+    /// (e.g. `project_name`, `reserved_gpio_code`). These are supplied through
+    /// `Facts::values`, so a template-scoped key of the same name is already
+    /// beaten by the binary's first-writer-wins rule.
     Value,
+    /// A namespace of related fields, addressed as `name.field` (`chip`).
+    /// Registered directly rather than through `Facts::values`, so it needs
+    /// explicit protection from a template-scoped value of the same name.
+    Struct,
 }
 
 /// The fact API, grouped by the SDK release that introduced each batch.
@@ -84,17 +90,17 @@ const REGISTRY: &[(Version, &[(&str, FeatureKind)])] = &[(
         // Predicates (registered in `process::build_env`).
         ("option", FeatureKind::Predicate),
         ("group_selected", FeatureKind::Predicate),
-        ("chip_has", FeatureKind::Predicate),
-        ("is_xtensa", FeatureKind::Predicate),
-        ("is_riscv", FeatureKind::Predicate),
         ("has_reserved_pins", FeatureKind::Predicate),
         // Binary-provided values (set by the binary's `Facts` builder).
+        //
+        // `chip` is a struct: `chip.name`, `chip.rust_target`,
+        // `chip.dram2_uninit_size` and one field per `esp-metadata` symbol.
+        // Its *fields* are not versioned individually — the symbol set is
+        // metadata-driven, and gaining a symbol is additive by construction.
+        ("chip", FeatureKind::Struct),
         ("project_name", FeatureKind::Value),
         ("generate_version", FeatureKind::Value),
         ("generate_parameters", FeatureKind::Value),
-        ("chip", FeatureKind::Value),
-        ("rust_target", FeatureKind::Value),
-        ("dram2_uninit_size", FeatureKind::Value),
         ("rust_toolchain", FeatureKind::Value),
         ("reserved_gpio_code", FeatureKind::Value),
     ],
@@ -133,14 +139,21 @@ pub fn feature_since(name: &str) -> Option<Version> {
     feature(name).map(|f| f.since)
 }
 
-/// Whether `name` is a binary-owned predicate that a template-scoped value must
-/// not shadow.
+/// Whether `name` is registered *outside* `Facts::values`, so a value carrying
+/// that name must not be registered over it.
+///
+/// Predicates and structs qualify. Plain [`Value`](FeatureKind::Value) features
+/// do not — they are *supplied* through `Facts::values`, and skipping them here
+/// would drop the binary's own facts on the floor.
 ///
 /// Derived from [`REGISTRY`] rather than kept as its own list next to the
 /// registrations: the two would otherwise have to be edited together, and
 /// nothing would catch it when they weren't.
 pub fn is_reserved_name(name: &str) -> bool {
-    matches!(feature(name), Some(f) if f.kind == FeatureKind::Predicate)
+    matches!(
+        feature(name),
+        Some(f) if matches!(f.kind, FeatureKind::Predicate | FeatureKind::Struct)
+    )
 }
 
 /// The lowest SDK version that provides every feature in `used`, or `None` if
@@ -219,18 +232,40 @@ mod test {
     }
 
     #[test]
-    fn reserved_names_are_exactly_the_predicates() {
-        // `process` gates template-scoped values on this, so a predicate that
-        // fell out of the registry would silently become shadowable.
+    fn reserved_names_are_the_ones_not_supplied_through_values() {
+        // `process` gates template-scoped values on this. A predicate or struct
+        // that fell out of the registry would silently become shadowable; a
+        // plain value wrongly listed here would stop being registered at all,
+        // which is how `project_name` briefly went missing during the `chip`
+        // namespacing.
         for f in features() {
+            let bypasses_values = matches!(f.kind, FeatureKind::Predicate | FeatureKind::Struct);
             assert_eq!(
                 is_reserved_name(f.name),
-                f.kind == FeatureKind::Predicate,
-                "`{}` is reserved iff it is a predicate",
-                f.name
+                bypasses_values,
+                "`{}` ({:?}) is reserved iff it bypasses `Facts::values`",
+                f.name,
+                f.kind
             );
         }
+        assert!(is_reserved_name("chip"), "the chip struct must be reserved");
+        assert!(
+            !is_reserved_name("project_name"),
+            "a plain value is supplied *through* `values` and must stay registerable"
+        );
         assert!(!is_reserved_name("definitely_not_a_fact"));
+    }
+
+    #[test]
+    fn the_chip_namespace_replaced_the_capability_predicate() {
+        // Chip capabilities are `chip.<symbol>` fields now, so somni reports a
+        // typo itself. These names must not come back as separate facts.
+        for gone in ["chip_has", "is_xtensa", "is_riscv", "rust_target"] {
+            assert!(
+                feature(gone).is_none(),
+                "`{gone}` was folded into the `chip` struct"
+            );
+        }
     }
 
     #[test]
@@ -322,19 +357,16 @@ mod test {
 
     #[test]
     fn implemented_predicates_are_registered() {
-        for name in [
-            "option",
-            "group_selected",
-            "chip_has",
-            "is_xtensa",
-            "is_riscv",
-            "has_reserved_pins",
-        ] {
+        for name in ["option", "group_selected", "has_reserved_pins"] {
             assert!(
                 matches!(feature(name), Some(f) if f.kind == FeatureKind::Predicate),
                 "predicate `{name}` is not registered as a contract feature"
             );
         }
+        assert!(
+            matches!(feature("chip"), Some(f) if f.kind == FeatureKind::Struct),
+            "`chip` is a namespace, not a scalar value"
+        );
     }
 
     #[test]
