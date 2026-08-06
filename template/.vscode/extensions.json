@@ -1,4 +1,3 @@
-//%includefile option("vscode")
 {
     "recommendations": [
         "rust-lang.rust-analyzer",

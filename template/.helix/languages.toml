@@ -1,4 +1,3 @@
-#%includefile option("helix")
 [[language]]
 name = "rust"
 
@@ -9,9 +8,7 @@ environment.RUSTUP_TOOLCHAIN = "stable"
 #%endif
 [language-server.rust-analyzer.config]
 cargo.allTargets = false
-#REPLACE riscv32imac-unknown-none-elf rust_target
-cargo.target = "riscv32imac-unknown-none-elf"
+cargo.target = "{{ chip.rust_target }}"
 #%if chip.xtensa
-#REPLACE esp rust_toolchain
-cargo.extraEnv.RUSTUP_TOOLCHAIN = "esp"
+cargo.extraEnv.RUSTUP_TOOLCHAIN = "{{ rust_toolchain }}"
 #%endif

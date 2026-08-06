@@ -3,47 +3,37 @@
 //!
 //! ## One version, not two
 //!
-//! The contract is versioned by this crate's own semver version carries both meanings:
+//! This crate's semver carries both meanings: the **major** is the spec version
+//! (a breaking contract change bumps it), the **minor** the additive-feature
+//! level. A template declares the version it was written against and
+//! [`is_compatible`] is the whole gate.
 //!
-//! * the **major** *is* the spec version — a breaking contract change bumps it
-//! * the **minor** is the additive-feature level — a template that uses a newer
-//!   fact needs an SDK at least that new.
+//! ## Scope: what the SDK implements, and nothing else
 //!
-//! A template declares the SDK version it was written against, and
-//! [`is_compatible`] is the whole gate. Tagging features with the crate's
-//! *current* version also means a feature is usable the moment it lands: the
-//! SDK that implements it satisfies its own `since` by construction, with no
-//! release ceremony in between.
+//! Only names this crate provides *and enforces* belong here — those are the
+//! only ones `sdk_version` can promise. Out of scope:
 //!
-//! ## Scope: the fact API, not the language
+//! * the template **language**, versioned by the engine's semver;
+//! * **plugin surfaces** (`chip` and its fields, `plugin:` fragments), versioned
+//!   by the plugin a template pins in `[plugins]` — see [`crate::plugin`];
+//! * **host values** (`project_name`, …), which arrive through
+//!   [`Facts::values`](crate::process::Facts::values) and which a host may
+//!   supply none of.
 //!
-//! This registry covers only the facts the SDK registers for template
-//! expressions — the predicates and values in [`FEATURES`]. The template
-//! *language* (directive keywords, interpolation, expression syntax) belongs to
-//! the templating engine and is versioned by that dependency's semver in
-//! `Cargo.toml`. Two surfaces, two owners, one version number each.
+//! What is left is the predicates this crate registers, so everything here is
+//! reserved: a template-scoped value may not shadow one.
 
 use std::sync::LazyLock;
 
-/// Contract versions are **strict semver**, ordering included.
+/// Contract versions are **strict semver**, ordering included: `2.0.0-rc.1 <
+/// 2.0.0`, so an rc does not satisfy a requirement of `2.0.0`.
 ///
-/// This matters for [`is_compatible`]: semver orders `2.0.0-rc.1 < 2.0.0`, so a
-/// prerelease build does *not* satisfy a requirement of `2.0.0`. A hand-rolled
-/// `major.minor.patch` type that discards the suffix would compare them equal
-/// and let an rc — which may not yet implement the feature being gated —
-/// silently pass.
-///
-/// Host *tool* versions (rustc, espflash, probe-rs) are a different problem:
-/// they are reported in loose formats and their prereleases should be treated
-/// as good enough. That leniency lives in the binary's `check` module and is
-/// deliberately not shared with this type.
+/// Host tool versions (rustc, probe-rs, …) are reported in looser formats and
+/// want laxer prerelease handling. That is the host's concern, deliberately not
+/// this type's.
 pub use semver::Version;
 
 /// The contract version this SDK implements: its own crate version.
-///
-/// There is no separate spec-version integer — the semver major already means
-/// "breaking contract change", so a template that works with SDK `1.x` works
-/// with every `1.y >= 1.x` and with no `2.z`.
 pub static SDK_VERSION: LazyLock<Version> = LazyLock::new(|| {
     Version::parse(env!("CARGO_PKG_VERSION")).expect("crate version must be strict semver")
 });
@@ -60,123 +50,54 @@ pub const fn release(major: u64, minor: u64, patch: u64) -> Version {
     }
 }
 
-/// What kind of contract surface a [`Feature`] describes.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum FeatureKind {
-    /// A somni predicate callable from a template condition (e.g. `chip_has`).
-    Predicate,
-    /// A binary-provided value a template can interpolate or test against
-    /// (e.g. `project_name`, `reserved_gpio_code`). These are supplied through
-    /// `Facts::values`, so a template-scoped key of the same name is already
-    /// beaten by the binary's first-writer-wins rule.
-    Value,
-    /// A namespace of related fields, addressed as `name.field` (`chip`).
-    /// Registered directly rather than through `Facts::values`, so it needs
-    /// explicit protection from a template-scoped value of the same name.
-    Struct,
-}
-
 /// The fact API, grouped by the SDK release that introduced each batch.
 ///
-/// **Adding a feature:** append it to the last group if that group's version is
-/// still unreleased, otherwise start a new group at the current crate version.
-/// A group must never be newer than [`SDK_VERSION`] — the SDK has to satisfy
-/// its own registry, which `no_feature_claims_to_predate_the_sdk_that_ships_it`
-/// enforces.
-const REGISTRY: &[(Version, &[(&str, FeatureKind)])] = &[(
+/// **Adding a feature:** append it to the last group if that version is still
+/// unreleased, otherwise start a new group at the current crate version.
+const REGISTRY: &[(Version, &[&str])] = &[(
     // The whole fact API landed in the first SDK release.
     release(0, 1, 0),
-    &[
-        // Predicates (registered in `process::build_env`).
-        ("option", FeatureKind::Predicate),
-        ("group_selected", FeatureKind::Predicate),
-        ("has_reserved_pins", FeatureKind::Predicate),
-        // Binary-provided values (set by the binary's `Facts` builder).
-        //
-        // `chip` is a struct: `chip.name`, `chip.rust_target`,
-        // `chip.dram2_uninit_size` and one field per `esp-metadata` symbol.
-        // Its *fields* are not versioned individually — the symbol set is
-        // metadata-driven, and gaining a symbol is additive by construction.
-        ("chip", FeatureKind::Struct),
-        ("project_name", FeatureKind::Value),
-        ("generate_version", FeatureKind::Value),
-        ("generate_parameters", FeatureKind::Value),
-        ("rust_toolchain", FeatureKind::Value),
-        ("reserved_gpio_code", FeatureKind::Value),
-    ],
+    // Predicates, registered by `process::register_facts`.
+    &["option", "group_selected"],
 )];
 
-/// One contract feature, resolved out of [`REGISTRY`].
+/// One contract feature, as yielded by [`features()`].
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Feature {
+struct Feature {
     /// The name a template references.
     pub name: &'static str,
-    pub kind: FeatureKind,
     /// The SDK release that introduced this feature.
     pub since: Version,
 }
 
 /// Every contract feature, oldest group first.
-pub fn features() -> impl Iterator<Item = Feature> {
+fn features() -> impl Iterator<Item = Feature> {
     REGISTRY.iter().flat_map(|(since, batch)| {
-        batch.iter().map(move |(name, kind)| Feature {
+        batch.iter().map(move |name| Feature {
             name,
-            kind: *kind,
             since: since.clone(),
         })
     })
 }
 
 /// Look up a contract feature by the name a template references.
-pub fn feature(name: &str) -> Option<Feature> {
+fn feature(name: &str) -> Option<Feature> {
     features().find(|f| f.name == name)
 }
 
-/// The introduced-at version of a known feature, or `None` if the name isn't a
-/// contract feature. (Validation — "unknown name = hard error" — is a separate
-/// concern owned by `check`; this only answers "when was it introduced?".)
-pub fn feature_since(name: &str) -> Option<Version> {
-    feature(name).map(|f| f.since)
+/// Whether `name` is one the SDK registers itself, so a template value must not
+/// be registered over it. Derived from the registry rather than a second list.
+pub(crate) fn is_reserved_name(name: &str) -> bool {
+    feature(name).is_some()
 }
 
-/// Whether `name` is registered *outside* `Facts::values`, so a value carrying
-/// that name must not be registered over it.
+/// Whether an SDK at `sdk` can run a template written against `required`:
+/// same compatibility range, and `sdk >= required`.
 ///
-/// Predicates and structs qualify. Plain [`Value`](FeatureKind::Value) features
-/// do not — they are *supplied* through `Facts::values`, and skipping them here
-/// would drop the binary's own facts on the floor.
-///
-/// Derived from [`REGISTRY`] rather than kept as its own list next to the
-/// registrations: the two would otherwise have to be edited together, and
-/// nothing would catch it when they weren't.
-pub fn is_reserved_name(name: &str) -> bool {
-    matches!(
-        feature(name),
-        Some(f) if matches!(f.kind, FeatureKind::Predicate | FeatureKind::Struct)
-    )
-}
-
-/// The lowest SDK version that provides every feature in `used`, or `None` if
-/// `used` references no contract feature at all — such a template asks nothing
-/// of the SDK, so any version will run it.
-pub fn min_sdk_version<'a>(used: impl IntoIterator<Item = &'a str>) -> Option<Version> {
-    used.into_iter().filter_map(feature_since).max()
-}
-
-/// Whether an SDK at `sdk` can run a template written against `required`.
-///
-/// Two conditions, which together replace the old `spec_version` + floor pair:
-///
-/// * **same compatibility range** — a major bump (or, below 1.0, a minor bump)
-///   is a breaking contract change, so it must not silently apply;
-/// * **`sdk >= required`** — the SDK has to actually provide the features.
-///
-/// Note this is deliberately *not* `semver::VersionReq`'s caret matching, which
-/// excludes prereleases outside the comparator's own version: `2.1.0-rc.1` does
-/// satisfy a requirement of `2.0.0` here, because an rc of a later release does
-/// contain everything the earlier one had. esp-generate ships rcs, and locking
-/// their users out of every template would be the wrong trade. A prerelease of
-/// the *required* version itself still fails, since `2.0.0-rc.1 < 2.0.0`.
+/// Deliberately *not* `semver::VersionReq` caret matching, which excludes
+/// prereleases outside the comparator's own version. `2.1.0-rc.1` satisfies
+/// `2.0.0` here — esp-generate ships rcs, and locking their users out of every
+/// template would be the wrong trade. `2.0.0-rc.1` still fails `2.0.0`.
 pub fn is_compatible(sdk: &Version, required: &Version) -> bool {
     compatibility_range(sdk) == compatibility_range(required) && sdk >= required
 }
@@ -199,17 +120,13 @@ mod test {
 
     #[test]
     fn the_contract_version_is_the_crate_version() {
-        // The whole point of dropping `SPEC_VERSION`: there is one number, and
-        // Cargo owns it. If this ever needs a second source of truth, the
-        // single-version model has broken down.
         assert_eq!(SDK_VERSION.to_string(), env!("CARGO_PKG_VERSION"));
     }
 
     #[test]
     fn no_feature_claims_to_predate_the_sdk_that_ships_it() {
-        // A feature is usable the moment it lands, so its group can never be
-        // ahead of the crate version — that would make the SDK fail to satisfy
-        // its own registry.
+        // A group ahead of the crate version would make the SDK fail to
+        // satisfy its own registry.
         for f in features() {
             assert!(
                 is_compatible(&SDK_VERSION, &f.since),
@@ -223,8 +140,6 @@ mod test {
 
     #[test]
     fn registry_groups_are_ordered_and_distinct() {
-        // The grouping only pays off if it stays a changelog: one entry per
-        // release, oldest first.
         let versions: Vec<&Version> = REGISTRY.iter().map(|(v, _)| v).collect();
         for pair in versions.windows(2) {
             assert!(pair[0] < pair[1], "groups must be strictly increasing");
@@ -232,38 +147,44 @@ mod test {
     }
 
     #[test]
-    fn reserved_names_are_the_ones_not_supplied_through_values() {
-        // `process` gates template-scoped values on this. A predicate or struct
-        // that fell out of the registry would silently become shadowable; a
-        // plain value wrongly listed here would stop being registered at all,
-        // which is how `project_name` briefly went missing during the `chip`
-        // namespacing.
+    fn every_registered_name_is_reserved_and_nothing_else_is() {
+        // A name that fell out of the registry becomes silently shadowable; a
+        // host value wrongly listed stops being registered at all.
         for f in features() {
-            let bypasses_values = matches!(f.kind, FeatureKind::Predicate | FeatureKind::Struct);
-            assert_eq!(
-                is_reserved_name(f.name),
-                bypasses_values,
-                "`{}` ({:?}) is reserved iff it bypasses `Facts::values`",
-                f.name,
-                f.kind
-            );
+            assert!(is_reserved_name(f.name), "`{}` must be reserved", f.name);
         }
-        assert!(is_reserved_name("chip"), "the chip struct must be reserved");
         assert!(
             !is_reserved_name("project_name"),
-            "a plain value is supplied *through* `values` and must stay registerable"
+            "a host value is supplied *through* `values` and must stay registerable"
         );
         assert!(!is_reserved_name("definitely_not_a_fact"));
     }
 
     #[test]
-    fn the_chip_namespace_replaced_the_capability_predicate() {
+    fn host_supplied_values_are_not_registered() {
+        for name in [
+            "project_name",
+            "generate_version",
+            "generate_parameters",
+            "rust_toolchain",
+            "reserved_gpio_code",
+            "has_reserved_pins",
+        ] {
+            assert!(
+                feature(name).is_none(),
+                "`{name}` is supplied by the host, so `sdk_version` cannot promise it"
+            );
+        }
+    }
+
+    #[test]
+    fn the_purpose_picked_chip_facts_are_gone() {
         // Chip capabilities are `chip.<symbol>` fields now, so somni reports a
         // typo itself. These names must not come back as separate facts.
         for gone in ["chip_has", "is_xtensa", "is_riscv", "rust_target"] {
             assert!(
                 feature(gone).is_none(),
-                "`{gone}` was folded into the `chip` struct"
+                "`{gone}` is a plugin namespace field now, not an SDK feature"
             );
         }
     }
@@ -296,6 +217,7 @@ mod test {
         // today, so getting it wrong would be a live bug, not a future one.
         assert!(!is_compatible(&release(0, 2, 0), &release(0, 1, 0)));
         assert!(!is_compatible(&release(0, 1, 0), &release(0, 2, 0)));
+        assert!(!is_compatible(&release(1, 2, 0), &release(0, 0, 0)));
         assert!(is_compatible(&release(0, 1, 5), &release(0, 1, 2)));
 
         // `0.0.x` releases are each their own range.
@@ -357,16 +279,22 @@ mod test {
 
     #[test]
     fn implemented_predicates_are_registered() {
-        for name in ["option", "group_selected", "has_reserved_pins"] {
+        for name in ["option", "group_selected"] {
             assert!(
-                matches!(feature(name), Some(f) if f.kind == FeatureKind::Predicate),
+                feature(name).is_some(),
                 "predicate `{name}` is not registered as a contract feature"
             );
         }
-        assert!(
-            matches!(feature("chip"), Some(f) if f.kind == FeatureKind::Struct),
-            "`chip` is a namespace, not a scalar value"
-        );
+    }
+
+    #[test]
+    fn plugin_surfaces_are_not_sdk_features() {
+        for name in ["chip", "chip.name", "chip.rust_target", "plugin:chip"] {
+            assert!(
+                feature(name).is_none(),
+                "`{name}` comes from a plugin, so `sdk_version` cannot promise it"
+            );
+        }
     }
 
     #[test]
@@ -379,32 +307,5 @@ mod test {
                 "`{name}` is language surface — version it via the engine dependency"
             );
         }
-    }
-
-    #[test]
-    fn a_template_using_no_contract_features_requires_nothing() {
-        // Not `Some(0.0.0)`: that sentinel used to flow into `is_compatible`,
-        // whose range check then declared a 1.2.0 SDK incompatible with a
-        // template that asks for nothing at all.
-        assert_eq!(min_sdk_version([]), None);
-        assert!(!is_compatible(&release(1, 2, 0), &release(0, 0, 0)));
-        // Unknown names are a `check` hard error, handled elsewhere.
-        assert_eq!(min_sdk_version(["totally_made_up"]), None);
-    }
-
-    #[test]
-    fn the_requirement_rises_to_the_newest_feature_used() {
-        let baseline = min_sdk_version(["option", "chip_has"]).unwrap();
-        assert_eq!(baseline, feature_since("option").unwrap());
-
-        // Synthetic newer feature: the requirement must climb to it without
-        // coupling the test to a real future feature.
-        let later = release(0, 9, 0);
-        let computed = [feature_since("option").unwrap(), later.clone()]
-            .into_iter()
-            .max()
-            .unwrap();
-        assert_eq!(computed, later);
-        assert!(computed > baseline);
     }
 }

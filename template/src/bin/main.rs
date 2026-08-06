@@ -1,5 +1,5 @@
 //%if option("embassy")
-//%include "src/bin/main_async.rs"
+//%include ".template/partials/main_async.rs"
 //%else
-//%include "src/bin/main_blocking.rs"
+//%include ".template/partials/main_blocking.rs"
 //%endif

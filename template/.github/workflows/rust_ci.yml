@@ -1,4 +1,3 @@
-#%includefile option("ci")
 ---
 # GitHub Actions uses `${{ … }}`, which collides with the default `{{ … }}`
 # interpolation. Pick delimiters that cannot occur in a workflow file.

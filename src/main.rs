@@ -1,6 +1,6 @@
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
-use esp_generate::Chip;
+use esp_generate::plugin;
 use esp_generate::process;
 use esp_generate::template::{GeneratorOption, GeneratorOptionItem, SetValue, Template};
 use esp_generate::{
@@ -15,7 +15,6 @@ use indexmap::IndexMap;
 use inquire::Text;
 use ratatui::crossterm::event;
 use std::collections::HashSet;
-use std::fmt::Write;
 use std::{
     collections::HashMap,
     env, fs,
@@ -26,37 +25,133 @@ use std::{
 };
 use taplo::formatter::Options;
 
-use esp_generate::template_files::TEMPLATE_FILES;
+use esp_generate::{TemplateSource, manifest, plugins};
 
 mod check;
-mod chip_selector;
 mod toolchain;
 mod tui;
 
-static TEMPLATE: LazyLock<Template> = LazyLock::new(|| {
-    // Load `template.yaml` as the root and resolve every `!Include <path>`
-    // against the bundled `TEMPLATE_FILES` table. This is the one place
-    // that knows how include paths map onto real files; the rest of the
-    // generator sees an already-flattened tree.
-    let root_yaml = TEMPLATE_FILES
+/// The template being generated from. One day a CLI flag.
+const SOURCE: TemplateSource = TemplateSource::Bundled;
+
+/// Resolve an option-tree `!Include` against the template's own files.
+///
+/// `plugin:` paths never reach here — the SDK resolves those first, so a
+/// template file cannot shadow a plugin fragment by sitting at the same path.
+fn load_include(path: &str) -> Option<String> {
+    SOURCE.get(path).map(str::to_string)
+}
+
+/// Whether any selected option declares `requires_nightly`.
+///
+/// Xtensa is exempt: its toolchain is `esp`, which already carries what nightly
+/// would provide and has no nightly channel to filter down to.
+fn requires_nightly(
+    selected: &[String],
+    flat_options: &[GeneratorOption],
+    is_xtensa: bool,
+) -> bool {
+    if is_xtensa {
+        return false;
+    }
+
+    selected
         .iter()
-        .find_map(|(k, v)| (*k == "template.yaml").then_some(*v))
+        .any(|name| find_option(name, flat_options).is_some_and(|(_, opt)| opt.requires_nightly))
+}
+
+/// Host tools the selected options declare they need. The binary still owns
+/// the checking — it only pre-flights tools it knows how to check.
+fn required_tools<'a>(
+    selected: &[String],
+    flat_options: &'a [GeneratorOption],
+) -> HashSet<&'a str> {
+    selected
+        .iter()
+        .filter_map(|name| find_option(name, flat_options))
+        .flat_map(|(_, opt)| opt.requires_tools.iter().map(String::as_str))
+        .collect()
+}
+
+/// The selection as plugins see it: the option names, plus each selection
+/// group's pick — which is how a plugin identifies its own group's choice.
+fn selection(options: Vec<String>, flat: &[GeneratorOption]) -> plugin::Selection {
+    let mut groups = IndexMap::new();
+    let mut sets: IndexMap<String, SetValue> = IndexMap::new();
+    for name in &options {
+        let Some((_, opt)) = find_option(name, flat) else {
+            continue;
+        };
+        if !opt.selection_group.is_empty() {
+            groups
+                .entry(opt.selection_group.clone())
+                .or_insert_with(|| name.clone());
+        }
+        for (key, value) in &opt.sets {
+            sets.entry(key.clone()).or_insert_with(|| value.clone());
+        }
+    }
+    plugin::Selection {
+        options,
+        groups,
+        sets,
+    }
+}
+
+/// Merge scalar `sets` from the selected options into `facts`.
+fn merge_template_sets(facts: &mut process::Facts, selected: &[String], flat: &[GeneratorOption]) {
+    for name in selected {
+        let Some((_, opt)) = find_option(name, flat) else {
+            continue;
+        };
+        for (key, value) in &opt.sets {
+            if let Some(scalar) = value.as_scalar() {
+                facts.set_value(key.clone(), scalar);
+            }
+        }
+    }
+}
+
+static MANIFEST: LazyLock<Result<manifest::Manifest, String>> =
+    LazyLock::new(|| manifest::Manifest::load(SOURCE).map_err(|e| format!("{e:#}")));
+
+/// The parsed manifest, or the reason the template can't be used.
+fn manifest() -> Result<&'static manifest::Manifest> {
+    MANIFEST.as_ref().map_err(|e| anyhow::anyhow!("{e}"))
+}
+
+static PLUGINS: LazyLock<esp_generate::plugin::Plugins> = LazyLock::new(plugins);
+
+/// Resolved before anything else, so a template naming a vocabulary this
+/// binary lacks fails with one line rather than unknown names mid-render.
+static RESOLVED: LazyLock<Result<esp_generate::plugin::Resolved<'static>, String>> =
+    LazyLock::new(|| {
+        let manifest = manifest().map_err(|e| format!("{e:#}"))?;
+        PLUGINS.resolve(&manifest.plugins)
+    });
+
+/// The resolved plugins, or the reason the template can't be used.
+fn resolved() -> Result<&'static esp_generate::plugin::Resolved<'static>> {
+    RESOLVED.as_ref().map_err(|e| anyhow::anyhow!("{e}"))
+}
+
+static TEMPLATE: LazyLock<Template> = LazyLock::new(|| {
+    let root_yaml = SOURCE
+        .get("template.yaml")
         .expect("bundled templates missing template.yaml");
 
-    let template = Template::load(root_yaml, |path| {
-        TEMPLATE_FILES
-            .iter()
-            .find_map(|(k, v)| (*k == path).then(|| v.to_string()))
-    })
-    .expect("failed to load bundled template");
+    let resolved =
+        resolved().expect("the bundled template must declare plugins this binary provides");
 
-    // The `chip` category is authored in YAML but must stay aligned with the
-    // `Chip` enum for the generator to work.
-    chip_selector::validate_chip_category(&template.options)
-        .expect("invalid `chip` category in bundled template");
+    let template =
+        Template::load(root_yaml, resolved, load_include).expect("failed to load bundled template");
+
     template
         .validate_required()
         .expect("invalid `required` list in bundled template");
+    template
+        .validate_capabilities(resolved)
+        .expect("invalid `requires_capabilities` in bundled template");
 
     template
 });
@@ -317,11 +412,9 @@ fn about() -> String {
     );
 
     let toml = cargo::CargoToml::load(
-        TEMPLATE_FILES
-            .iter()
-            .find(|(k, _)| *k == "Cargo.toml")
-            .expect("Cargo.toml not found in template")
-            .1,
+        SOURCE
+            .get("Cargo.toml")
+            .expect("Cargo.toml not found in template"),
     )
     .expect("Failed to read Cargo.toml");
 
@@ -422,11 +515,9 @@ fn main() -> Result<()> {
     }
 
     let versions = cargo::CargoToml::load(
-        TEMPLATE_FILES
-            .iter()
-            .find(|(k, _)| *k == "Cargo.toml")
-            .expect("Cargo.toml not found in template")
-            .1,
+        SOURCE
+            .get("Cargo.toml")
+            .expect("Cargo.toml not found in template"),
     )
     .expect("Failed to read Cargo.toml");
 
@@ -442,8 +533,7 @@ fn main() -> Result<()> {
         esp_hal_version.clone()
     };
 
-    // `rust-version` is a Cargo MSRV, not strict semver — `1.95` is legal and
-    // has no patch component, so it goes through the lenient tool parser.
+    // A Cargo MSRV is not strict semver — `1.95` is legal — so parse leniently.
     let msrv_raw = versions.msrv();
     let Some(msrv) = check::parse_lenient(msrv_raw) else {
         bail!("template `Cargo.toml` has an unparsable `rust-version`: `{msrv_raw}`");
@@ -513,9 +603,16 @@ fn main() -> Result<()> {
         initial_selected.push(tc.clone());
     }
 
-    // `initial_selections` is already a group → pick map built off the pristine
-    // template, so the chip is a direct lookup here.
-    let initial_facts = chip_from_name(group_pick(&initial_selections, "chip")).map(Chip::facts);
+    // Facts come from the resolved plugins, so a template sees the vocabulary
+    // version it pinned.
+    let initial_facts = Some(
+        resolved()?
+            .facts(&selection(
+                initial_selected.clone(),
+                &flatten_options(&initial_options),
+            ))
+            .map_err(|e| anyhow::anyhow!("{e}"))?,
+    );
 
     let repository = tui::Repository::new(initial_options, &initial_selected, initial_facts);
 
@@ -572,11 +669,14 @@ fn main() -> Result<()> {
             let scan_needs_reflecting = scan_finished && !populated_with_scan;
 
             if signature_changed || scan_needs_reflecting {
-                let chip = chip_from_name(group_pick(&current_compat, "chip"));
+                let picked = selection(app.selected_options(), &app.repository.config.flat_options);
+                let new_facts = resolved()?
+                    .facts(&picked)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
 
                 let filtered = toolchain::toolchains_for_chip(
                     &cached_toolchains,
-                    chip,
+                    toolchain::ChipTarget::from_facts(&new_facts).as_ref(),
                     &msrv,
                     args.toolchain.as_deref(),
                 );
@@ -584,11 +684,9 @@ fn main() -> Result<()> {
                     log::warn!("{warning}");
                 }
 
-                // Facts before options: both cascade out selections that no
-                // longer hold, and the cascade must run against the *new*
-                // chip's capabilities. Installing the tree first would drop
-                // options using the outgoing chip's symbol set.
-                app.repository.config.set_facts(chip.map(Chip::facts));
+                // Facts before options: the cascade must run against the new
+                // chip's capabilities, not the outgoing chip's.
+                app.repository.config.set_facts(Some(new_facts));
 
                 let new_options = build_options(
                     &current_compat,
@@ -667,151 +765,77 @@ fn main() -> Result<()> {
         })
         .cloned();
 
-    // The selection groups that have a pick, backing `group_selected(...)`.
-    // Kept as a separate list rather than appended to `selected`: option and
-    // group names live in disjoint namespaces, so `option("<group>")` must not
-    // answer true (the bundled template has `coding-agent-guidance` as both a
-    // category and a group).
+    // Groups with a pick, backing `group_selected(...)`. Separate from
+    // `selected` because option and group names are disjoint namespaces —
+    // `coding-agent-guidance` is both a category and a group.
     let mut selected_groups: Vec<String> = Vec::new();
     for name in &selected {
-        let (_, option) = find_option(name, &flat_options).unwrap();
+        let Some((_, option)) = find_option(name, &flat_options) else {
+            bail!("selected option `{name}` is not in the template");
+        };
         if !option.selection_group.is_empty() && !selected_groups.contains(&option.selection_group)
         {
             selected_groups.push(option.selection_group.clone());
         }
     }
 
-    // `set_value` keeps the first writer, so binary facts below take precedence
-    // over template-scoped `sets` merged later — a template can't shadow `chip`,
-    // `project_name`, etc.
-    let chip = chip_from_name(selected_chip_name(&selected, &flat_options));
-    let mut facts = chip.map(Chip::facts).unwrap_or_default();
+    // `set_value` keeps the first writer, so these take precedence over the
+    // template `sets` merged later.
+    let mut facts = resolved()?
+        .facts(&selection(selected.clone(), &flat_options))
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    // The vocabularies behind the unknown-name hard error. Each is the set of
-    // names that could be true for *some* selection, so a misspelling is
-    // distinguishable from a name that is simply not true right now. Chip
-    // capabilities need no entry here: they are fields of the `chip` struct, so
-    // somni reports an unknown one itself, pointing at the source.
-    facts.vocabulary.options = TEMPLATE
-        .all_options()
-        .iter()
-        .map(|o| o.name.clone())
-        .chain(flat_options.iter().map(|o| o.name.clone()))
-        .collect();
-    facts.vocabulary.groups = TEMPLATE
-        .all_options()
-        .iter()
-        .map(|o| o.selection_group.clone())
-        .chain(flat_options.iter().map(|o| o.selection_group.clone()))
-        .filter(|g| !g.is_empty())
-        .collect();
+    // Every name that could be true for *some* selection, so a misspelling is
+    // distinguishable from a name that is merely false right now.
+    facts.vocabulary.options = Some(
+        TEMPLATE
+            .all_options()
+            .iter()
+            .map(|o| o.name.clone())
+            .chain(flat_options.iter().map(|o| o.name.clone()))
+            .collect(),
+    );
+    facts.vocabulary.groups = Some(
+        TEMPLATE
+            .all_options()
+            .iter()
+            .map(|o| o.selection_group.clone())
+            .chain(flat_options.iter().map(|o| o.selection_group.clone()))
+            .filter(|g| !g.is_empty())
+            .collect(),
+    );
     facts.set_value("generate_version", env!("CARGO_PKG_VERSION"));
     facts.set_value("project_name", name.clone());
     facts.set_value("generate_parameters", selected_options);
     facts.set_value("esp_hal_version_full", esp_hal_version_full);
 
-    // The remaining chip-dependent facts also depend on the rest of the
-    // selection (the picked module's reserved pins, the toolchain), so they
-    // can't live in `Chip::facts`.
-    if let Some(chip) = chip {
+    // The toolchain is a host decision, so it stays here; the chip-derived
+    // half of it arrives as facts.
+    if let Some(target) = toolchain::ChipTarget::from_facts(&facts) {
         if let Some(tc) = selected_toolchain.as_ref() {
             facts.set_value("rust_toolchain", tc.clone());
         }
-        // `rust-toolchain.toml` used to carry the per-ISA default inline, which
-        // only worked because a missing substitution left the literal in place.
-        // Interpolation has no such fallback, so the default lives here — where
-        // the ISA is actually known. `set_value` keeps the first writer, so an
-        // explicitly selected toolchain still wins.
-        let default_toolchain = if chip.metadata().is_xtensa() {
-            "esp"
-        } else {
-            "stable"
-        };
-        facts.set_value("rust_toolchain", default_toolchain);
+        // Interpolation has no fallback for an unset name, so the per-ISA
+        // default lives here. First writer wins, so an explicit pick still does.
+        facts.set_value(
+            "rust_toolchain",
+            if target.is_xtensa { "esp" } else { "stable" },
+        );
 
-        let mut reserved_gpio_code = String::new();
-
-        if let Some(remove_pins) = selected.iter().find_map(|name| {
-            // Find module, then get the pins that should be considered for removal/noting.
-            find_option(name, &flat_options)
-                .filter(|(_, opt)| opt.selection_group == "module")
-                .map(|(_, opt)| {
-                    opt.sets
-                        .get("remove_pins")
-                        .and_then(SetValue::as_list)
-                        .unwrap_or(&[])
-                })
-        }) {
-            let restricted_pins = chip.pins().iter().filter(|pin| {
-                remove_pins
-                    .iter()
-                    .any(|lim| pin.limitations.contains(&lim.as_str()))
-            });
-            let strapping_pins = chip
-                .pins()
-                .iter()
-                .filter(|pin| pin.limitations.contains(&"strapping"))
-                .collect::<Vec<_>>();
-
-            if !strapping_pins.is_empty() {
-                let strapping = strapping_pins
-                    .iter()
-                    .map(|pin| format!("// - GPIO{}", pin.pin))
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                writeln!(
-                    &mut reserved_gpio_code,
-                    r#"// The following pins are used to bootstrap the chip. They are available
-                    // for use, but check the datasheet of the module for more information on them.
-                    {strapping}"#
-                )
-                .unwrap();
-            }
-
-            // Backs the `has_reserved_pins` fact.
-            if restricted_pins.clone().next().is_some() {
-                facts.has_reserved_pins = true;
-
-                let pin_plucker = restricted_pins
-                    .map(|pin| format!("    let _ = peripherals.GPIO{};", pin.pin))
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                writeln!(
-                &mut reserved_gpio_code,
-                r#"// These GPIO pins are in use by some feature of the module and should not be used.
-                {pin_plucker}"#
-            )
-            .unwrap();
-            };
-        }
-        facts.set_value("reserved_gpio_code", reserved_gpio_code);
-
-        // Check versions and install tools only when a chip is known, and
-        // BEFORE we generate the project.
+        let tools = required_tools(&selected, &flat_options);
         check::check(
-            chip.metadata(),
-            selected.contains(&"probe-rs".to_string()),
+            target.is_xtensa,
+            tools.contains("probe-rs"),
             msrv,
-            selected.contains(&"stack-smashing-protection".to_string())
-                && !chip.metadata().is_xtensa(),
+            requires_nightly(&selected, &flat_options, target.is_xtensa),
             args.headless,
             selected_toolchain.as_deref(),
         );
     }
 
-    // Merge scalar `sets` from selected options (e.g. `wokwi-board`).
-    // List-valued entries are consumed directly by code-generation paths
-    // (see the pin-reservation block above) and are skipped here.
-    for name in &selected {
-        let Some((_, opt)) = find_option(name, &flat_options) else {
-            continue;
-        };
-        for (key, value) in &opt.sets {
-            if let Some(scalar) = value.as_scalar() {
-                facts.set_value(key.clone(), scalar);
-            }
-        }
-    }
+    // After every host value above — first writer wins, so this is what stops
+    // a template `sets` key from displacing one.
+    merge_template_sets(&mut facts, &selected, &flat_options);
 
     let project_dir = path.join(&name);
 
@@ -821,42 +845,52 @@ fn main() -> Result<()> {
         );
     }
 
+    // Before rendering, so an existing directory fails immediately.
     fs::create_dir(&project_dir)?;
 
-    // Resolves `include` paths against the bundled template table. Paths are
-    // template-root-relative, so this is the same key space `TEMPLATE_FILES`
-    // uses and an unknown path simply has no entry.
-    let mut load_partial = |path: &str| -> Result<String, String> {
-        TEMPLATE_FILES
-            .iter()
-            .find_map(|(k, v)| (*k == path).then(|| v.to_string()))
-            .ok_or_else(|| format!("no template file `{path}`"))
-    };
+    let mut load_partial = |path: &str| SOURCE.read(path).map(str::to_string);
 
-    for &(source_path, contents) in TEMPLATE_FILES.iter() {
-        let mut out_path = source_path.to_string();
-        let processed = process::process_file(
-            contents,
-            &selected,
-            &selected_groups,
-            &facts,
-            &mut out_path,
-            &mut load_partial,
-        )
-        .map_err(|e| anyhow::anyhow!("{source_path}:{e}"))?;
-        let Some(processed) = processed else {
-            continue; // excluded by `includefile`
+    // Built once: the selections and facts are the same for every file.
+    let renderer = process::Renderer::new(&selected, &selected_groups, &facts);
+
+    let mut planned: Vec<(PathBuf, String)> = Vec::new();
+    let manifest = manifest()?;
+
+    for (source_path, contents) in SOURCE.files() {
+        let manifest::Emit::When { condition, output } = manifest.emit(source_path) else {
+            continue;
+        };
+        if let Some(condition) = condition {
+            let what = format!("`emit.when` condition for `{source_path}`");
+            if !renderer.evaluate(condition, &what)? {
+                continue;
+            }
+        }
+
+        let processed = renderer
+            .render(contents, &mut load_partial)
+            .map_err(|e| anyhow::anyhow!("{source_path}:{e}"))?;
+
+        let out_path = match output {
+            Some(path) => {
+                let what = format!("`emit.as` path for `{source_path}`");
+                renderer.output_path(path, &what)?
+            }
+            None => source_path.to_string(),
         };
 
-        // Reject any output path that escapes the project dir, even after
-        // the SDK already validates `#INCLUDE_AS` paths.
+        // The manifest is template-authored: a rename must not walk out of
+        // the project directory.
         if !process::is_safe_relative_path(&out_path) {
             bail!("template file `{source_path}` resolved to unsafe output path `{out_path}`");
         }
-        let out_path = project_dir.join(out_path);
 
+        planned.push((project_dir.join(out_path), processed));
+    }
+
+    for (out_path, contents) in planned {
         fs::create_dir_all(out_path.parent().unwrap())?;
-        fs::write(out_path, processed)?;
+        fs::write(out_path, contents)?;
     }
 
     // Run cargo fmt:
@@ -968,7 +1002,11 @@ fn process_options(template: &Template, args: &Args) -> Result<()> {
         .flat_map(|opt_name| flat_options.iter().position(|o| &o.name == opt_name))
         .collect();
 
-    let facts = chip_from_name(selected_chip_name(&args.option, &flat_options)).map(Chip::facts);
+    let facts = Some(
+        resolved()?
+            .facts(&selection(args.option.clone(), &flat_options))
+            .map_err(|e| anyhow::anyhow!("{e}"))?,
+    );
 
     let selected_config = ActiveConfiguration {
         selected,
@@ -1076,62 +1114,6 @@ fn process_options(template: &Template, args: &Args) -> Result<()> {
     }
 }
 
-/// The name of the option picked in the `chip` selection group, if any.
-///
-/// Resolved through the option tree rather than by parsing names: `chip` is an
-/// ordinary selection group, so membership in it — not the spelling of the name
-/// — is what makes an option a chip.
-fn selected_chip_name<'a>(
-    selected: &'a [String],
-    flat_options: &[GeneratorOption],
-) -> Option<&'a str> {
-    selected
-        .iter()
-        .find(|name| {
-            find_option(name, flat_options).is_some_and(|(_, opt)| opt.selection_group == "chip")
-        })
-        .map(String::as_str)
-}
-
-/// The option picked for `group` in a compatibility signature, or `None` when
-/// the group has no pick.
-///
-/// [`ActiveConfiguration::compatibility_signature`] reports an unpicked group
-/// as the **empty string** rather than omitting the key. This is the single
-/// place that translation happens, so every other function can treat a name it
-/// receives as a real one.
-fn group_pick<'a>(signature: &'a HashMap<String, String>, group: &str) -> Option<&'a str> {
-    signature
-        .get(group)
-        .map(String::as_str)
-        .filter(|name| !name.is_empty())
-}
-
-/// Parse a `chip` group pick into the [`Chip`] it names. `None` means no chip
-/// has been selected.
-///
-/// Every non-`None` name is required to be a real one, and is infallible:
-/// [`chip_selector::validate_chip_category`] rejects, at [`TEMPLATE`] load, any
-/// option in the `chip` group whose name is not a `Chip` variant — `""`
-/// included, since it parses as no variant.
-///
-/// The empty string is therefore *not* accepted as a spelling of "no chip".
-/// Silently mapping it to `None` here would mean any future path that produced
-/// an empty name — a signature read without [`group_pick`], a malformed option
-/// — would quietly disable `requires_capabilities` gating instead of failing.
-fn chip_from_name(name: Option<&str>) -> Option<Chip> {
-    let name = name?;
-    assert!(
-        !name.is_empty(),
-        "an unpicked selection group must arrive as `None`, not `\"\"` — \
-         read compatibility signatures through `group_pick`"
-    );
-    Some(
-        name.parse()
-            .expect("chip category is validated when TEMPLATE loads"),
-    )
-}
-
 fn should_initialize_git_repo(mut path: &Path) -> bool {
     loop {
         let dotgit_path = path.join(".git");
@@ -1152,74 +1134,270 @@ fn should_initialize_git_repo(mut path: &Path) -> bool {
 #[cfg(test)]
 mod test {
     use esp_generate::config::flatten_options;
+    use esp_template_plugin_chip::Chip;
+    use strum::IntoEnumIterator;
 
     use super::*;
 
-    /// The TUI's normal startup state is "no chip picked yet", which
-    /// `compatibility_signature` reports as an *empty string*, not an absent
-    /// key. `group_pick` is the one place that gets normalised.
+    /// Loading `MANIFEST` runs the same check, but only when generating — this
+    /// makes a rename that outdates a rule fail `cargo test`.
     #[test]
-    fn an_unpicked_group_reads_as_no_pick() {
-        let mut signature = HashMap::new();
-        signature.insert("chip".to_string(), String::new());
-        assert_eq!(group_pick(&signature, "chip"), None, "unpicked group");
-        assert_eq!(group_pick(&signature, "absent"), None, "absent key");
-
-        signature.insert("chip".to_string(), "esp32c6".to_string());
-        assert_eq!(group_pick(&signature, "chip"), Some("esp32c6"));
+    fn the_bundled_manifest_matches_the_bundled_files() {
+        manifest().expect("the bundled manifest must be usable");
     }
 
-    /// End-to-end against the *real* producer: the TUI's state before the user
-    /// picks a chip. This is the path the invariant could plausibly break, so
-    /// it pins both halves — that a signature really does report `""`, and that
-    /// reading it through `group_pick` keeps `chip_from_name` from asserting.
+    /// A template `sets` key must not displace a host value of the same name.
+    /// Host values are written first, and this merge never overwrites.
     #[test]
-    fn the_tui_startup_signature_does_not_trip_the_invariant() {
-        let options = TEMPLATE.options.clone();
-        let flat_options = flatten_options(&options);
-        let config = ActiveConfiguration {
-            selected: Vec::new(),
-            flat_options,
-            options,
-            facts: None,
+    fn a_template_set_cannot_displace_a_host_value() {
+        let mut opt = GeneratorOption {
+            name: "sneaky".to_string(),
+            ..Default::default()
         };
-
-        let signature = config.compatibility_signature(&["chip".to_string()]);
-        assert_eq!(
-            signature.get("chip").map(String::as_str),
-            Some(""),
-            "precondition: an unpicked group is reported as an empty string"
+        opt.sets.insert(
+            "has_reserved_pins".to_string(),
+            SetValue::scalar("template-wins"),
         );
+        opt.sets
+            .insert("its_own_key".to_string(), SetValue::scalar("kept"));
 
-        assert_eq!(chip_from_name(group_pick(&signature, "chip")), None);
+        let mut facts = process::Facts::default();
+        facts.set_value("has_reserved_pins", true);
+
+        merge_template_sets(&mut facts, &["sneaky".to_string()], &[opt]);
+
+        assert_eq!(
+            facts.values.get("has_reserved_pins"),
+            Some(&process::FactValue::Bool(true)),
+            "a template `sets` key displaced a host value"
+        );
+        assert_eq!(
+            facts.values.get("its_own_key"),
+            Some(&process::FactValue::Str("kept".into())),
+            "a key the host never set must still come through"
+        );
+    }
+
+    /// Old-syntax directives are emitted verbatim rather than rejected, so a
+    /// missed one is invisible until someone reads a generated project. Walks
+    /// `SOURCE.files()` rather than globbing, so dotfiles can't be skipped.
+    #[test]
+    fn no_file_uses_the_pre_somni_directive_syntax() {
+        const GONE: [&str; 3] = ["REPLACE", "INCLUDEFILE", "INCLUDE_AS"];
+
+        for (path, contents) in SOURCE.files() {
+            for (n, line) in contents.lines().enumerate() {
+                let trimmed = line.trim_start();
+                for prefix in ["//", "#", "--"] {
+                    let Some(rest) = trimmed.strip_prefix(prefix) else {
+                        continue;
+                    };
+                    if let Some(directive) = GONE.iter().find(|d| rest.starts_with(**d)) {
+                        panic!(
+                            "{path}:{} uses the removed `{prefix}{directive}` directive: {trimmed}",
+                            n + 1
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The reserved directory is why partials need no per-file marker; if the
+    /// rule stopped applying, every partial would be emitted as a source file.
+    #[test]
+    fn no_template_machinery_is_emitted() {
+        let manifest = manifest().expect("the bundled manifest must be usable");
+        for (path, _) in SOURCE.files() {
+            let machinery = path == manifest::MANIFEST_PATH
+                || path == "template.yaml"
+                || path.starts_with(&format!("{}/", manifest::RESERVED_DIR));
+
+            assert_eq!(
+                manifest.emit(path) == manifest::Emit::Never,
+                machinery,
+                "`{path}` is emitted iff it is not template machinery"
+            );
+        }
     }
 
     #[test]
-    fn chip_from_name_resolves_real_names() {
-        assert_eq!(chip_from_name(None), None);
-        assert_eq!(chip_from_name(Some("esp32c6")), Some(Chip::Esp32c6));
+    fn every_chip_has_at_least_one_module() {
+        let module_category = TEMPLATE
+            .options
+            .iter()
+            .find_map(|item| match item {
+                GeneratorOptionItem::Category(c) if c.name == "module" => Some(c),
+                _ => None,
+            })
+            .expect("module category is required by the generator");
+
+        for chip in Chip::iter() {
+            let chip_name = chip.to_string();
+            let has_module = module_category.options.iter().any(|item| {
+                let GeneratorOptionItem::Option(o) = item else {
+                    return false;
+                };
+                o.compatible
+                    .get("chip")
+                    .is_some_and(|list| list.iter().any(|n| n == &chip_name))
+            });
+            assert!(has_module, "no modules declared for {chip_name}");
+        }
     }
 
-    /// An empty name is a bug, not a spelling of "no chip". Accepting it would
-    /// let any path that lost track of the signature convention silently
-    /// disable `requires_capabilities` gating rather than fail.
+    /// `diagram.json` picks its board with an `if`/`else if` chain and no
+    /// `else`, so a chip the chain misses emits JSON with no `"type"` key —
+    /// invalid, but only noticed when Wokwi refuses to open it.
     #[test]
-    #[should_panic(expected = "must arrive as `None`")]
-    fn chip_from_name_rejects_the_unpicked_sentinel() {
-        chip_from_name(Some(""));
+    fn every_wokwi_chip_has_a_board_in_the_diagram() {
+        let allowed = TEMPLATE
+            .all_options()
+            .into_iter()
+            .find(|o| o.name == "wokwi")
+            .expect("the bundled template offers wokwi")
+            .compatible
+            .get("chip")
+            .expect("wokwi is chip-restricted")
+            .clone();
+
+        let diagram = SOURCE.get("diagram.json").expect("wokwi ships a diagram");
+
+        for chip in &allowed {
+            assert!(
+                diagram.contains(&format!("chip.name == \"{chip}\"")),
+                "`diagram.json` has no board for `{chip}`, which wokwi allows"
+            );
+        }
     }
 
-    /// A chip is whatever sits in the `chip` selection group — not whatever
-    /// happens to spell like one. Run against the real bundled template so the
-    /// lookup can't drift from `template.yaml`.
+    /// Groups the binary populates at runtime, picked with a dedicated flag
+    /// rather than `-o`.
+    const NOT_DASH_O: &[&str] = &["toolchain"];
+
+    /// Everything about an option that changes what selecting it *does*.
+    /// Excludes `display_name`/`help` (presentation) and `compatible` (already
+    /// applied by pruning before we compare).
+    #[derive(Debug, PartialEq)]
+    struct SelectionBehaviour<'a> {
+        selection_group: &'a str,
+        requires: &'a [String],
+        requires_capabilities: &'a [String],
+        requires_nightly: bool,
+        sets: Vec<(&'a str, &'a SetValue)>,
+    }
+
+    impl<'a> SelectionBehaviour<'a> {
+        fn of(option: &'a GeneratorOption) -> Self {
+            Self {
+                selection_group: &option.selection_group,
+                requires: &option.requires,
+                requires_capabilities: &option.requires_capabilities,
+                requires_nightly: option.requires_nightly,
+                sets: option.sets.iter().map(|(k, v)| (k.as_str(), v)).collect(),
+            }
+        }
+    }
+
+    /// Every TUI-selectable option must be expressible on the command line, or
+    /// the two front ends drift.
+    ///
+    /// `-o <name>` resolves to the *first* option with that name, so a duplicate
+    /// name is only safe while both entries behave identically — as the bundled
+    /// `probe-rs` and `defmt` pairs do.
     #[test]
-    fn only_an_option_in_the_chip_group_names_a_chip() {
+    fn every_selectable_option_is_expressible_as_dash_o() {
+        for chip in Chip::iter() {
+            let selections = HashMap::from([("chip".to_string(), chip.to_string())]);
+            let options = build_options(&selections, None, &[]);
+            let flat = flatten_options(&options);
+
+            let mut by_name: HashMap<&str, Vec<&GeneratorOption>> = HashMap::new();
+            for option in &flat {
+                if NOT_DASH_O.contains(&option.selection_group.as_str()) {
+                    continue;
+                }
+                assert!(
+                    !option.name.is_empty(),
+                    "{chip}: an option with no name cannot be selected with `-o`"
+                );
+                by_name
+                    .entry(option.name.as_str())
+                    .or_default()
+                    .push(option);
+            }
+
+            for (name, variants) in by_name {
+                let [first, rest @ ..] = variants.as_slice() else {
+                    unreachable!("every entry has at least one variant")
+                };
+                for other in rest {
+                    assert_eq!(
+                        SelectionBehaviour::of(first),
+                        SelectionBehaviour::of(other),
+                        "{chip}: `-o {name}` resolves to the first of several options that do \
+                         not behave the same, so the flag cannot express what the TUI can"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The exemption above must stay earned: if the toolchain group stops
+    /// carrying a name `-o` can't express, the entry is dead.
+    #[test]
+    fn the_dash_o_exemption_is_still_needed() {
         let flat = flatten_options(&TEMPLATE.options);
 
-        let selected = vec!["alloc".to_string(), "esp32h2".to_string()];
-        assert_eq!(selected_chip_name(&selected, &flat), Some("esp32h2"));
+        for group in NOT_DASH_O {
+            let members: Vec<&str> = flat
+                .iter()
+                .filter(|o| o.selection_group == *group)
+                .map(|o| o.name.as_str())
+                .collect();
 
-        assert_eq!(selected_chip_name(&["alloc".to_string()], &flat), None);
-        assert_eq!(selected_chip_name(&[], &flat), None);
+            assert!(!members.is_empty(), "`{group}` has no options at all");
+            assert!(
+                members.iter().any(|name| name.is_empty()),
+                "`{group}` is exempt from `-o` parity, but every member is nameable: {members:?}"
+            );
+        }
+    }
+
+    /// The nightly requirement comes from the option tree, not a known name.
+    /// `find_option` returns the first match by name, so every variant of an
+    /// option must declare the same tools.
+    #[test]
+    fn the_tool_requirement_is_read_from_the_option_tree() {
+        let flat = flatten_options(&TEMPLATE.options);
+
+        assert!(
+            required_tools(&["probe-rs".to_string()], &flat).contains("probe-rs"),
+            "the bundled template must declare `requires_tools` on probe-rs"
+        );
+        assert!(required_tools(&["alloc".to_string()], &flat).is_empty());
+        assert!(required_tools(&[], &flat).is_empty());
+
+        for opt in flat.iter().filter(|o| o.name == "probe-rs") {
+            assert!(
+                opt.requires_tools.iter().any(|t| t == "probe-rs"),
+                "every `probe-rs` variant must declare the tool"
+            );
+        }
+    }
+
+    #[test]
+    fn the_nightly_requirement_is_read_from_the_option_tree() {
+        let flat = flatten_options(&TEMPLATE.options);
+        let ssp = vec!["stack-smashing-protection".to_string()];
+
+        assert!(
+            requires_nightly(&ssp, &flat, false),
+            "the bundled template must declare `requires_nightly` on this option"
+        );
+        assert!(!requires_nightly(&["alloc".to_string()], &flat, false));
+        assert!(!requires_nightly(&[], &flat, false));
+
+        assert!(!requires_nightly(&ssp, &flat, true), "Xtensa is exempt");
     }
 }

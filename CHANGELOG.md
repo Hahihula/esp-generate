@@ -12,14 +12,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Add an optional coding-agent guidance template submenu for selecting `AGENTS.md`, `CLAUDE.md`, `CODEX.md`, or `GEMINI.md`. (#335)
 - Generated Xtensa projects now check for the required linker and point Unix users to source espup's export file when it is missing. (#343)
+- Templates now carry a `metadata.toml` manifest. It declares the `esp-template-sdk` version the template is written against — checked before any template file is read, so an incompatible template fails with one clear line — and per-file `emit` rules: `when` is the condition a file is emitted under, `as` the path it is written to. A file with no rule is emitted as-is. (#357)
 
 ### Changed
 
 - The template contract (option tree, relationship engine, directive processor) now lives in a separate `esp-template-sdk` crate. Generated projects are unchanged. (#352)
-- **Template syntax.** File directives are now rendered by [`somni-template`](https://docs.rs/somni-template). Directive lines are marked with the file's comment prefix plus `%` (`#%if`, `//%endif`, `--%else`) so ordinary comments are never parsed as directives; `#ELIF` is now `#%else if`; and `#REPLACE` is replaced by `{{ expr }}` interpolation. `#%includefile` and `#%include_as` are unchanged apart from the marker. Generated projects are unchanged. (#352)
+- **Template syntax.** File directives are now rendered by [`somni-template`](https://docs.rs/somni-template). Directive lines are marked with the file's comment prefix plus `%` (`#%if`, `//%endif`, `--%else`) so ordinary comments are never parsed as directives; `#ELIF` is now `#%else if`; and `#REPLACE` is replaced by `{{ expr }}` interpolation. Generated projects are unchanged. (#352)
 - `sets` keys that a template interpolates must be valid identifiers: `wokwi-board` is now `wokwi_board`, and `coding-agent-guidance-file` is now `coding_agent_guidance_file`. (#352)
-- Template directives evaluate against a single fact API: `is_xtensa`/`is_riscv`/`has_reserved_pins`/`chip_has()` replace the old pseudo-options, and values such as `chip` and `dram2_uninit_size` can now be used in `#IF` conditions. Value names are `snake_case`. (#352)
+- Template directives evaluate against a single fact API. `option()` and `group_selected()` are the predicates, and everything the chip decides is a field on a `chip` struct: `chip.name`, `chip.rust_target`, `chip.dram2_uninit_size`, and one field per `esp-metadata` symbol (`chip.soc_has_wifi`). A misspelled field is an error naming the file and line, not a silent `false`. Value names are `snake_case`. (#352)
 - `option()` no longer matches selection-group names — use `group_selected()`. (#352)
+- **Chip data is a versioned plugin.** It lives in a new `esp-template-plugin-chip` crate whose version mirrors the `esp-metadata-generated` it wraps, so the version names a symbol set rather than a release. A template declares what it needs — `plugins = { chip = "0.4.0" }` in `metadata.toml` — and pulls the chip selection group in with `!Include plugin:chip`. A binary that cannot provide a declared plugin refuses the template with one line instead of failing on unknown names part-way through rendering, and can offer several versions at once so older templates keep working. (#357)
+- The option tree's chip list is generated from the chip plugin rather than carried as template YAML, so newly supported silicon appears in the menu without a template edit. (#357)
+- A template's `.template/` directory is reserved for machinery — option-tree fragments and `include` partials — and is never emitted. (#357)
+- What an option needs is declared in the option tree rather than hardcoded in esp-generate: `requires_nightly: true` for a nightly toolchain, `requires_tools: [probe-rs]` for a host tool. Both drive the pre-flight check before generation. (#357)
 - Chip selector has been moved to the TUI. (#328)
 - The chip needs to be specified as `-o <chip>` instead of `--chip <chip>` when using CLI (#328)
 - Generated projects now keep runtime configuration in `.cargo/esp-config.toml` and include it from `.cargo/config.toml` (#326)
@@ -28,11 +33,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - Malformed template directives now report a `file:line` error instead of panicking or being silently ignored.
+- A `requires_capabilities` entry that names no plugin namespace — `soc_has_wifi` rather than `chip.soc_has_wifi` — is now refused when the template loads. It previously read as false for every selection, silently hiding the option. (#357)
 - Fixed neovim config (#336)
 
 ### Removed
 
 - Removed the BLE `bleps` option. (#341)
+- The `#%includefile` and `#%include_as` directives. Which files a generated project gets, and what they are called, is the manifest's job now — a file's own body no longer decides whether that file exists. (#357)
 
 ## [1.3.0] - 2026-04-24
 

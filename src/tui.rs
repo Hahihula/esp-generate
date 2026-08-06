@@ -234,7 +234,7 @@ impl Repository {
     /// the `chip` selection group behave as a radio — clicking the already-
     /// selected chip is a no-op; switching chips goes through the usual
     /// `select_idx` cascade.
-    fn toggle_current(&mut self, row: usize) {
+    fn toggle_current(&mut self, row: usize, required_groups: &[String]) {
         if !self.current_level_is_active() {
             return;
         }
@@ -245,12 +245,10 @@ impl Repository {
         };
 
         let option_name = option.name.clone();
-        // The chip group behaves like a required radio: there must always be
-        // exactly one chip ticked (the one backing the current options tree),
-        // so clicking the already-selected chip is a no-op instead of a
-        // deselect. Switching to a different chip still works through the
-        // usual selection_group mutex in `select_idx`.
-        let is_chip_group = option.selection_group == "chip";
+        // A required group is a radio: it must always have exactly one pick, so
+        // clicking the current one is a no-op rather than a deselect. Switching
+        // within the group still works through the `select_idx` mutex.
+        let is_required_group = required_groups.contains(&option.selection_group);
 
         if let Some(i) = self
             .config
@@ -258,7 +256,7 @@ impl Repository {
             .iter()
             .position(|s| self.config.flat_options[*s].name == option_name)
         {
-            if is_chip_group {
+            if is_required_group {
                 return;
             }
             let idx = self.config.selected[i];
@@ -642,8 +640,8 @@ impl App {
 #[cfg(test)]
 mod test {
     use super::Repository;
-    use crate::Chip;
     use esp_generate::template::{GeneratorOption, GeneratorOptionItem};
+    use esp_template_plugin_chip::Chip;
     use indexmap::IndexMap;
 
     fn option(name: &str, requires: &[&str]) -> GeneratorOptionItem {
@@ -733,7 +731,7 @@ mod test {
 
         // Simulate the user ticking `esp32` in the chip group (`toggle_current`
         // treats the chip radio as non-deselect, so the selection sticks).
-        app.repository.toggle_current(0);
+        app.repository.toggle_current(0, &["chip".to_string()]);
         assert!(app.can_save(), "required group satisfied — save unlocked");
         assert!(app.missing_required_groups().is_empty());
     }
@@ -772,7 +770,7 @@ mod test {
             None,
         );
 
-        repository.toggle_current(0);
+        repository.toggle_current(0, &[]);
         assert!(repository.config.is_selected("method"));
         assert!(!repository.config.is_selected("method-unselected-a"));
         assert!(!repository.config.is_selected("method-unselected-b"));
@@ -780,7 +778,7 @@ mod test {
 
         repository.config.select("method-selected-a");
 
-        repository.toggle_current(0);
+        repository.toggle_current(0, &[]);
         assert!(!repository.config.is_selected("method"));
         assert!(!repository.config.is_selected("method-selected-a"));
         // None of the previously-cleared `!method` options come back.
@@ -1075,13 +1073,13 @@ mod test {
         ];
         let mut repository = Repository::new(options, &["esp32".to_string()], None);
 
-        repository.toggle_current(0);
+        repository.toggle_current(0, &["chip".to_string()]);
         assert!(
             repository.config.is_selected("esp32"),
             "clicking the already-selected chip must be a no-op"
         );
 
-        repository.toggle_current(1);
+        repository.toggle_current(1, &["chip".to_string()]);
         assert!(
             repository.config.is_selected("esp32c6"),
             "clicking a different chip must swap the selection"
@@ -1204,7 +1202,7 @@ mod test {
         // Before applying `set_options`, mimic what `toggle_current` would
         // have done: swap the chip-group pick on the *old* tree. This is the
         // state the main loop sees when it triggers the rebuild.
-        repository.toggle_current(1);
+        repository.toggle_current(1, &["chip".to_string()]);
         assert!(repository.config.is_selected("esp32c6"));
 
         repository.set_options(rebuilt);
@@ -1258,7 +1256,8 @@ impl App {
                         }
 
                         if self.repository.is_option(selected) {
-                            self.repository.toggle_current(selected);
+                            self.repository
+                                .toggle_current(selected, &self.required_groups);
                         } else if !self.repository.visible_item(selected).options().is_empty() {
                             self.repository.enter_group(self.selected());
                             self.enter_menu();
