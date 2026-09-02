@@ -7,7 +7,6 @@ use ratatui::crossterm::{
 };
 
 use esp_generate::contract;
-use esp_metadata_generated::Chip;
 
 /// Host tool/toolchain versions. The *type* is shared with the SDK's contract
 /// versions (one `semver::Version` for the whole workspace), but the *parsing*
@@ -64,7 +63,7 @@ enum CheckResult {
 }
 
 pub fn check(
-    chip: Chip,
+    is_xtensa: bool,
     probe_rs_required: bool,
     msrv: Version,
     requires_nightly: bool,
@@ -73,7 +72,7 @@ pub fn check(
 ) {
     let rust_toolchain: String = if let Some(name) = selected_toolchain {
         name.to_string()
-    } else if chip.is_xtensa() {
+    } else if is_xtensa {
         "esp".to_string()
     } else if requires_nightly {
         "nightly".to_string()
@@ -81,7 +80,7 @@ pub fn check(
         "stable".to_string()
     };
 
-    let rust_toolchain_tool = if chip.is_xtensa() { "espup" } else { "rustup" };
+    let rust_toolchain_tool = if is_xtensa { "espup" } else { "rustup" };
 
     if rust_toolchain_tool == "espup" {
         // We don't enforce a minimum espup version here, we just care that it exists.

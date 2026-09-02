@@ -3,11 +3,8 @@ use std::collections::HashMap;
 use crate::process::{FactValue, Facts};
 use crate::template::{GeneratorOption, GeneratorOptionItem};
 
-/// Whether a chip field counts as "has this capability".
-///
-/// Boolean symbols say so directly; a string-valued symbol
-/// (`bt_controller = "npl"`) counts as present unless it is empty, which is how
-/// a chip that lacks it entirely is represented.
+/// Whether a plugin field counts as "has this capability". A string counts as
+/// present unless empty, which is how an absent one is represented.
 fn is_truthy(value: &FactValue) -> bool {
     match value {
         FactValue::Bool(b) => *b,
@@ -24,8 +21,8 @@ pub struct ActiveConfiguration {
     pub options: Vec<GeneratorOptionItem>,
     /// All available option items (categories are not included), flattened to avoid the need for recursion.
     pub flat_options: Vec<GeneratorOption>,
-    /// Chip-derived facts for capability gating. `None` means unconstrained —
-    /// `requires_capabilities` is not enforced until a chip is picked.
+    /// Plugin facts for capability gating. `None` means unconstrained —
+    /// `requires_capabilities` is not enforced until they arrive.
     pub facts: Option<Facts>,
 }
 
@@ -77,13 +74,13 @@ impl ActiveConfiguration {
     /// the pristine template and hands it over. The rest is mechanical:
     ///   * [`Self::rebuild_indices`] remaps selection indices by option name,
     ///     silently dropping any name that no longer exists in the new tree;
-    ///   * [`Self::drop_unsatisfied`] then cascades out anything whose
+    ///   * `drop_unsatisfied` then cascades out anything whose
     ///     requirements are no longer met against the trimmed set (e.g. an
     ///     option that survived by name but depended on something the chip
     ///     switch eliminated).
     ///
-    /// Note: `path` on the binary's TUI `Repository` is a UI concern and is
-    /// NOT touched here.
+    /// A host's own menu-position state is a UI concern and is NOT touched
+    /// here.
     pub fn reset_options(&mut self, options: Vec<GeneratorOptionItem>) {
         self.options = options;
         self.rebuild_indices();
@@ -138,7 +135,7 @@ impl ActiveConfiguration {
             .collect()
     }
 
-    pub fn is_group_selected(&self, group: &str) -> bool {
+    fn is_group_selected(&self, group: &str) -> bool {
         self.selected
             .iter()
             .any(|s| self.flat_options[*s].selection_group == group)
@@ -148,7 +145,7 @@ impl ActiveConfiguration {
         self.selected_index(option).is_some()
     }
 
-    pub fn selected_index(&self, option: &str) -> Option<usize> {
+    fn selected_index(&self, option: &str) -> Option<usize> {
         self.selected
             .iter()
             .position(|s| self.flat_options[*s].name == option)
@@ -168,7 +165,7 @@ impl ActiveConfiguration {
             if o.selection_group == group {
                 // We allow deselecting group options because we are changing the options in the
                 // group, so after this operation the group have a selected item still.
-                Self::can_be_disabled_impl(selected, options, s, true)
+                Self::can_be_disabled_impl(selected, options, s)
             } else {
                 true
             }
@@ -256,20 +253,23 @@ impl ActiveConfiguration {
     /// cascading deselection and after any chip / selection-group change that
     /// might have invalidated compatibility.
     fn drop_unsatisfied(&mut self) {
+        Self::evict_unsatisfied(&mut self.selected, &self.flat_options, self.facts.as_ref());
+    }
+
+    fn evict_unsatisfied(
+        selected: &mut Vec<usize>,
+        flat_options: &[GeneratorOption],
+        facts: Option<&Facts>,
+    ) {
         loop {
-            let victim = self.selected.iter().position(|&idx| {
-                let opt = &self.flat_options[idx];
-                !self.requirements_met(&opt.requires)
-                    || !Self::is_option_compatible_against(
-                        opt,
-                        &self.selected,
-                        &self.flat_options,
-                        self.facts.as_ref(),
-                    )
+            let victim = selected.iter().position(|&idx| {
+                let opt = &flat_options[idx];
+                !Self::requirements_met_against(&opt.requires, selected, flat_options)
+                    || !Self::is_option_compatible_against(opt, selected, flat_options, facts)
             });
             match victim {
                 Some(pos) => {
-                    self.selected.swap_remove(pos);
+                    selected.swap_remove(pos);
                 }
                 None => return,
             }
@@ -348,24 +348,7 @@ impl ActiveConfiguration {
         // is just another entry in the `chip` selection group and any option
         // with `compatible: {chip: [...]}` simply drops out of the simulated
         // set when the new chip isn't in its allow-list.
-        loop {
-            let victim = simulated.iter().position(|&idx| {
-                let opt = &self.flat_options[idx];
-                !Self::requirements_met_against(opt, &simulated, &self.flat_options)
-                    || !Self::is_option_compatible_against(
-                        opt,
-                        &simulated,
-                        &self.flat_options,
-                        self.facts.as_ref(),
-                    )
-            });
-            match victim {
-                Some(pos) => {
-                    simulated.swap_remove(pos);
-                }
-                None => break,
-            }
-        }
+        Self::evict_unsatisfied(&mut simulated, &self.flat_options, self.facts.as_ref());
 
         // Collateral = things that were selected but aren't in the simulated set
         // (excluding the option itself, which is the user's direct action).
@@ -379,11 +362,11 @@ impl ActiveConfiguration {
 
     /// Static helper: evaluate `option.requires` against an arbitrary selected set.
     fn requirements_met_against(
-        option: &GeneratorOption,
+        requires: &[String],
         selected: &[usize],
         flat_options: &[GeneratorOption],
     ) -> bool {
-        for requirement in &option.requires {
+        for requirement in requires {
             let (key, expected) = if let Some(rest) = requirement.strip_prefix('!') {
                 (rest, false)
             } else {
@@ -448,28 +431,7 @@ impl ActiveConfiguration {
     ///
     /// A selection group must not have the same name as an option.
     fn requirements_met(&self, requires: &[String]) -> bool {
-        for requirement in requires {
-            let (key, expected) = if let Some(requirement) = requirement.strip_prefix('!') {
-                (requirement, false)
-            } else {
-                (requirement.as_str(), true)
-            };
-
-            // Requirement is an option that must be selected?
-            if self.is_selected(key) == expected {
-                continue;
-            }
-
-            // Requirement is a group that must have a selected option?
-            let is_group = Self::group_exists(key, &self.flat_options);
-            if is_group && self.is_group_selected(key) == expected {
-                continue;
-            }
-
-            return false;
-        }
-
-        true
+        Self::requirements_met_against(requires, &self.selected, &self.flat_options)
     }
 
     /// Returns whether every `compatible: { group: [...] }` entry on `option`
@@ -493,10 +455,9 @@ impl ActiveConfiguration {
     /// Static variant of [`Self::is_option_compatible`] for evaluating against
     /// an arbitrary selection set (used by [`Self::would_force_deselect`]).
     ///
-    /// Two independent gates must hold: `compatible: { group: [...] }` allow-lists,
-    /// and every `requires_capabilities` entry being a chip field that is true.
-    /// With `facts = None` — or no chip picked — the capability gate is
-    /// unconstrained.
+    /// Two gates must hold: the `compatible: { group: [...] }` allow-lists, and
+    /// every `requires_capabilities` entry naming a fact that is true. With
+    /// `facts = None` the capability gate is unconstrained.
     fn is_option_compatible_against(
         option: &GeneratorOption,
         selected: &[usize],
@@ -513,13 +474,17 @@ impl ActiveConfiguration {
             }
         }
 
-        if let Some(chip) = facts.and_then(|f| f.chip.as_ref()) {
+        // A malformed or unprovided name reads as false here;
+        // `Template::validate_capabilities` rejects it at load.
+        if let Some(facts) = facts {
             for cap in &option.requires_capabilities {
-                // The chip carries a field for every symbol any chip declares,
-                // so an absent name is an unknown capability and a present-but-
-                // false one is a capability this chip lacks. Both fail the gate;
-                // `check` is what tells the author which of the two it was.
-                if !chip.get(cap).is_some_and(is_truthy) {
+                let satisfied = cap
+                    .split_once('.')
+                    .and_then(|(namespace, field)| {
+                        facts.structs.get(namespace)?.fields().get(field)
+                    })
+                    .is_some_and(is_truthy);
+                if !satisfied {
                     return false;
                 }
             }
@@ -600,30 +565,16 @@ impl ActiveConfiguration {
         true
     }
 
-    // An option can only be disabled if it's not required by any other selected option.
-    pub fn can_be_disabled(&self, option: &str) -> bool {
-        let (option, _) = find_option(option, &self.flat_options).unwrap();
-        Self::can_be_disabled_impl(&self.selected, &self.flat_options, option, false)
-    }
-
     fn can_be_disabled_impl(
         selected: &[usize],
         options: &[GeneratorOption],
         option: usize,
-        allow_deselecting_group: bool,
     ) -> bool {
         let op = &options[option];
-        for selected in selected.iter().copied() {
-            let selected_option = &options[selected];
-            if selected_option
-                .requires
-                .iter()
-                .any(|o| o == &op.name || (o == &op.selection_group && !allow_deselecting_group))
-            {
-                return false;
-            }
-        }
-        true
+        selected
+            .iter()
+            .copied()
+            .all(|s| !options[s].requires.iter().any(|o| o == &op.name))
     }
 
     pub fn collect_relationships<'a>(
@@ -892,7 +843,7 @@ mod test {
     }
 
     #[test]
-    fn depending_on_group_prevents_deselecting() {
+    fn deselecting_a_group_cascades_out_what_required_it() {
         let options = vec![
             GeneratorOptionItem::Option(GeneratorOption {
                 name: "option1".to_string(),
@@ -928,9 +879,16 @@ mod test {
 
         active.select("option1");
         active.select("option2");
+        assert!(active.is_selected("option1") && active.is_selected("option2"));
 
-        // Option1 can't be deselected because option2 requires that a `group` option is selected
-        assert!(!active.can_be_disabled("option1"));
+        let idx = find_option("option1", &active.flat_options).unwrap().0;
+        active.deselect_idx(idx);
+
+        assert!(!active.is_selected("option1"));
+        assert!(
+            !active.is_selected("option2"),
+            "option2 requires the `group`, which no longer has a pick"
+        );
     }
 
     #[test]
@@ -1321,7 +1279,7 @@ mod test {
             display_name: "Wi-Fi".to_string(),
             ..Default::default()
         };
-        wifi.requires_capabilities = vec!["soc_has_wifi".to_string()];
+        wifi.requires_capabilities = vec!["chip.soc_has_wifi".to_string()];
 
         let options = vec![GeneratorOptionItem::Option(wifi.clone())];
         let mut active = ActiveConfiguration {
@@ -1339,10 +1297,13 @@ mod test {
 
         // Every chip carries a field for every symbol; only the value differs.
         let chip_with = |has_wifi: bool| Facts {
-            chip: Some(IndexMap::from([
-                ("soc_has_wifi".to_string(), FactValue::Bool(has_wifi)),
-                ("soc_has_bt".to_string(), FactValue::Bool(true)),
-            ])),
+            structs: indexmap::IndexMap::from([(
+                "chip".to_string(),
+                crate::process::StructFacts::new([
+                    ("soc_has_wifi".into(), FactValue::Bool(has_wifi)),
+                    ("soc_has_bt".into(), FactValue::Bool(true)),
+                ]),
+            )]),
             ..Default::default()
         };
 
@@ -1353,8 +1314,7 @@ mod test {
 
         // Switching to a chip that LACKS it makes the option incompatible and
         // cascades it out of the selection (mirrors a `compatible` mismatch).
-        // The field is *present* and false — that is what lets a template's
-        // `chip.soc_has_wifi` be falsy rather than an unknown-field error.
+        // Present and false, rather than an unknown-field error.
         active.set_facts(Some(chip_with(false)));
         assert!(!active.is_option_compatible(&wifi));
         assert!(

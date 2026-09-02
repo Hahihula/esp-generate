@@ -8,13 +8,15 @@ use std::{
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
 use esp_generate::{
-    Chip,
+    TemplateSource,
     config::{ActiveConfiguration, find_option, flatten_options},
+    manifest::Manifest,
     template::{GeneratorOption, GeneratorOptionCategory, GeneratorOptionItem, Template},
-    template_files::TEMPLATE_FILES,
 };
+use esp_template_plugin_chip::Chip;
 use itertools::Itertools;
 use log::info;
+use strum::IntoEnumIterator;
 
 // Unfortunate hard-coded list of non-codegen options.
 const IGNORED_CATEGORIES: &[&str] = &[
@@ -49,6 +51,23 @@ fn is_chip_compatible(option: &GeneratorOption, chip: Chip) -> bool {
     }
 }
 
+/// Parse a chip name, listing the valid ones on failure.
+///
+/// `Chip` deliberately doesn't derive `clap::ValueEnum` — it lives in a data
+/// crate that has no business depending on a CLI framework — so the possible
+/// values are supplied here instead.
+fn parse_chip(name: &str) -> Result<Chip, String> {
+    name.parse().map_err(|_| {
+        format!(
+            "unknown chip `{name}`; expected one of: {}",
+            Chip::iter()
+                .map(|c| c.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    })
+}
+
 #[derive(Debug, Parser)]
 struct Cli {
     #[command(subcommand)]
@@ -61,7 +80,7 @@ enum Commands {
     /// formatted correctly
     Check {
         /// Target chip to check
-        #[arg(value_enum)]
+        #[arg(value_parser = parse_chip)]
         chip: Chip,
         /// Verify all possible options combinations
         #[arg(short, long)]
@@ -267,19 +286,37 @@ fn options_for_chip(chip: Chip, all_combinations: bool) -> Result<Vec<Vec<String
         IGNORED_CATEGORIES
     };
 
-    // Reuse the same bundled file table the binary uses so `!Include`
-    // expansion resolves identically here (and so xtask doesn't depend on
-    // its own relative path to the `template/` directory).
-    let root_yaml = TEMPLATE_FILES
-        .iter()
-        .find_map(|(k, v)| (*k == "template.yaml").then_some(*v))
+    // Reuse the same template source the binary uses so `!Include` expansion
+    // resolves identically here (and so xtask doesn't depend on its own
+    // relative path to the `template/` directory).
+    let source = TemplateSource::Bundled;
+    let root_yaml = source
+        .get("template.yaml")
         .ok_or_else(|| anyhow::anyhow!("bundled templates missing template.yaml"))?;
-    let template = Template::load(root_yaml, |path| {
-        TEMPLATE_FILES
-            .iter()
-            .find_map(|(k, v)| (*k == path).then(|| v.to_string()))
+    // The same reader and the same resolution the binary uses, so xtask cannot
+    // enumerate a combination production would refuse.
+    let manifest = Manifest::load(source)?;
+    let plugins = esp_generate::plugins();
+    let resolved = plugins
+        .resolve(&manifest.plugins)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let template = Template::load(root_yaml, &resolved, |path| {
+        source.get(path).map(str::to_string)
     })
     .map_err(|e| anyhow::anyhow!("failed to load bundled template: {e}"))?;
+
+    // Seeded with the chip group's pick, which is what the chip plugin keys its
+    // facts on.
+    let chip_facts = resolved
+        .facts(&esp_generate::plugin::Selection {
+            options: vec![chip.to_string()],
+            groups: [("chip".to_string(), chip.to_string())]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        })
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     let flat_options = flatten_options(&template.options);
 
@@ -357,7 +394,7 @@ fn options_for_chip(chip: Chip, all_combinations: bool) -> Result<Vec<Vec<String
                 selected: vec![chip_idx],
                 flat_options: flat_options.clone(),
                 options: template.options.clone(),
-                facts: Some(chip.facts()),
+                facts: Some(chip_facts.clone()),
             };
 
             if let Some(base_template) = base_template {
@@ -412,7 +449,7 @@ fn options_for_chip(chip: Chip, all_combinations: bool) -> Result<Vec<Vec<String
             selected,
             options: template_options.take().unwrap(),
             flat_options: flat_options.take().unwrap(),
-            facts: Some(chip.facts()),
+            facts: Some(chip_facts.clone()),
         };
 
         if is_valid(&config) {

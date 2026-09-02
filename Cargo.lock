@@ -490,7 +490,7 @@ dependencies = [
  "anyhow",
  "clap",
  "env_logger",
- "esp-metadata-generated",
+ "esp-template-plugin-chip",
  "esp-template-sdk",
  "indexmap",
  "inquire",
@@ -514,6 +514,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "42c2ee95b945a4780796e4359e72c033aed3b45073880e8029458f538532db8a"
 
 [[package]]
+name = "esp-template-plugin-chip"
+version = "0.4.0"
+dependencies = [
+ "esp-metadata-generated",
+ "esp-template-sdk",
+ "indexmap",
+ "strum 0.27.2",
+]
+
+[[package]]
 name = "esp-template-sdk"
 version = "0.1.0"
 dependencies = [
@@ -522,6 +532,7 @@ dependencies = [
  "semver",
  "serde",
  "serde_yaml",
+ "somni-expr",
  "somni-template",
 ]
 
@@ -1634,6 +1645,10 @@ name = "semver"
 version = "1.0.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8a7852d02fc848982e0c167ef163aaff9cd91dc640ba85e263cb1ce46fae51cd"
+dependencies = [
+ "serde",
+ "serde_core",
+]
 
 [[package]]
 name = "serde"
@@ -1676,6 +1691,15 @@ dependencies = [
  "serde",
  "serde_core",
  "zmij",
+]
+
+[[package]]
+name = "serde_spanned"
+version = "1.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6662b5879511e06e8999a8a235d848113e942c9124f211511b16466ee2995f26"
+dependencies = [
+ "serde_core",
 ]
 
 [[package]]
@@ -2088,6 +2112,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b59c4d22ed448339746c59b905d24568fcbb3ab65a500494f7b8c3e97739f2b"
 dependencies = [
  "indexmap",
+ "serde_core",
+ "serde_spanned",
  "toml_datetime",
  "toml_parser",
  "toml_writer",
@@ -2669,9 +2695,11 @@ dependencies = [
  "clap",
  "env_logger",
  "esp-generate",
+ "esp-template-plugin-chip",
  "itertools 0.14.0",
  "log",
  "serde_yaml",
+ "strum 0.27.2",
  "tempfile",
 ]
 

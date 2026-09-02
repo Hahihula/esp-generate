@@ -1,4 +1,3 @@
-//%includefile false
 //! Demo test suite using embedded-test
 //!
 //! You can run this using `cargo test` as usual.

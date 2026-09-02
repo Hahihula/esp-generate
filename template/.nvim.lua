@@ -1,12 +1,10 @@
---%includefile group_selected("neovim")
 -- You must enable the exrc setting in neovim for this config file to be used.
 local rust_analyzer = {
     cargo = {
         target = "{{ chip.rust_target }}",
         allTargets = false,
         --%if chip.xtensa
-        --REPLACE esp rust_toolchain
-        extraEnv = { RUSTUP_TOOLCHAIN = "esp" },
+        extraEnv = { RUSTUP_TOOLCHAIN = "{{ rust_toolchain }}" },
         --%endif
     },
 }
