@@ -28,6 +28,7 @@ use taplo::formatter::Options;
 use esp_generate::{TemplateSource, manifest, plugins};
 
 mod check;
+mod fetch;
 mod toolchain;
 mod tui;
 
@@ -166,8 +167,9 @@ struct Args {
     #[arg(short = 'O', long)]
     output_path: Option<PathBuf>,
 
-    /// Generate from a template directory instead of the bundled one
-    #[arg(long, global = true, value_name = "DIR")]
+    /// Generate from an external template: a directory, or a repository to
+    /// clone (`owner/repo[@branch-or-tag]`, an `https://` URL, or `git@host:path`)
+    #[arg(long, global = true, value_name = "DIR_OR_REPO")]
     template: Option<PathBuf>,
 
     /// Do not check for updates
@@ -423,22 +425,37 @@ fn wants_interactive(
 ///
 /// An external template decides what code lands in the project, so this is the
 /// one place a user is told they are trusting something other than us.
-fn template_source(args: &Args) -> Result<TemplateSource> {
-    let Some(dir) = args.template.as_ref() else {
-        return Ok(TemplateSource::Bundled);
+fn template_source(args: &Args) -> Result<(TemplateSource, Option<fetch::Checkout>)> {
+    let Some(value) = args.template.as_ref() else {
+        return Ok((TemplateSource::Bundled, None));
     };
+    let value = value.to_string_lossy();
 
-    if !dir.is_dir() {
-        bail!("`--template {}` is not a directory", dir.display());
-    }
+    let (root, checkout) = match fetch::parse_template_arg(&value)? {
+        fetch::TemplateRef::Local(dir) => (dir, None),
+        fetch::TemplateRef::Repo { url, reference } => {
+            log::info!(
+                "Cloning template from {url}{}",
+                reference
+                    .as_deref()
+                    .map(|r| format!(" at {r}"))
+                    .unwrap_or_default()
+            );
+            let checkout = fetch::clone(&url, reference.as_deref())?;
+            // The resolved commit, so a generated project can be traced back to
+            // exactly what produced it even when the ref later moves.
+            log::info!("Template resolved to {url}@{}", checkout.commit);
+            (checkout.root.clone(), Some(checkout))
+        }
+    };
 
     log::warn!(
         "⚠️  Generating from the external template at `{}`. A template controls \
          what code and dependencies end up in your project — only use ones you trust.",
-        dir.display()
+        root.display()
     );
 
-    Ok(TemplateSource::Directory(dir.clone()))
+    Ok((TemplateSource::Directory(root), checkout))
 }
 
 /// The `-o` help text. Built while clap builds `Args`, i.e. before any argument
@@ -541,7 +558,8 @@ fn main() -> Result<()> {
     let mut args = Args::parse();
 
     if let Some(subcommand) = args.subcommands.take() {
-        return subcommand.handle(&Loaded::open(template_source(&args)?)?);
+        let (source, _checkout) = template_source(&args)?;
+        return subcommand.handle(&Loaded::open(source)?);
     }
 
     // Only check for updates once the command-line arguments have been processed,
@@ -552,7 +570,9 @@ fn main() -> Result<()> {
         check_for_update(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
     }
 
-    let loaded = Loaded::open(template_source(&args)?)?;
+    // Held for the whole run: a cloned template is deleted when this drops.
+    let (source, _checkout) = template_source(&args)?;
+    let loaded = Loaded::open(source)?;
 
     let user_chose_nothing = args.option.is_empty();
 
