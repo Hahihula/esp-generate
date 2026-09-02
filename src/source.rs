@@ -8,45 +8,211 @@
 //! that `!Include` and `include` resolve against, and that a generated file
 //! lands on before `emit.as` gets a say.
 
+use std::borrow::Cow;
+use std::path::{Path, PathBuf};
+
+use crate::process::is_safe_relative_path;
 use crate::template_files::TEMPLATE_FILES;
+
+/// Never walked into: a template directory is often a git checkout, and
+/// `target/` is whatever the author last built.
+const SKIPPED_DIRS: &[&str] = &[".git", "target"];
 
 /// A template's file set.
 ///
-/// Only [`Bundled`](TemplateSource::Bundled) exists today.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Contents are [`Cow`] so a compiled-in template stays zero-copy while a
+/// directory owns what it reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TemplateSource {
     /// The template compiled into this binary by `build.rs`.
     Bundled,
+    /// A directory on disk, read as generation goes.
+    Directory(PathBuf),
 }
 
 impl TemplateSource {
-    /// The contents of `path`, or `None` if this template has no such file.
-    pub fn get(&self, path: &str) -> Option<&'static str> {
+    pub fn read(&self, path: &str) -> Result<Cow<'static, str>, String> {
         match self {
             TemplateSource::Bundled => TEMPLATE_FILES
                 .iter()
-                .find_map(|(k, v)| (*k == path).then_some(*v)),
+                .find_map(|(k, v)| (*k == path).then_some(Cow::Borrowed(*v)))
+                .ok_or_else(|| format!("template has no file `{path}`")),
+
+            TemplateSource::Directory(root) => {
+                if !is_safe_relative_path(path) {
+                    return Err(format!("`{path}` escapes the template directory"));
+                }
+                let full = root.join(path);
+                if !full.is_file() {
+                    return Err(format!("template has no file `{path}`"));
+                }
+                std::fs::read_to_string(&full)
+                    .map(Cow::Owned)
+                    .map_err(|e| format!("cannot read `{path}`: {e}"))
+            }
         }
     }
 
-    /// The contents of `path`, or an error naming it.
-    pub fn read(&self, path: &str) -> Result<&'static str, String> {
-        self.get(path)
-            .ok_or_else(|| format!("template has no file `{path}`"))
+    /// The contents of `path`, or `None` if this template has no such file.
+    pub fn get(&self, path: &str) -> Option<Cow<'static, str>> {
+        self.read(path).ok()
     }
 
-    /// Every `(path, contents)` pair, in the order the source lists them —
-    /// which is the order generation writes them in.
-    pub fn files(&self) -> impl Iterator<Item = (&'static str, &'static str)> {
+    /// Every `(path, contents)` pair — the order generation writes them in.
+    ///
+    /// Sorted by path, so a directory template generates in a stable order
+    /// rather than whatever the filesystem hands back.
+    pub fn files(&self) -> Result<Vec<(String, Cow<'static, str>)>, String> {
         match self {
-            TemplateSource::Bundled => TEMPLATE_FILES.iter().map(|(k, v)| (*k, *v)),
+            TemplateSource::Bundled => Ok(TEMPLATE_FILES
+                .iter()
+                .map(|(k, v)| (k.to_string(), Cow::Borrowed(*v)))
+                .collect()),
+
+            TemplateSource::Directory(root) => {
+                let mut out = Vec::new();
+                walk(root, root, &mut out)?;
+                out.sort_by(|a, b| a.0.cmp(&b.0));
+                Ok(out)
+            }
         }
     }
+}
+
+/// Collect every readable file under `dir`, keyed root-relative with `/`.
+///
+/// Symlinks are skipped rather than followed: one pointing outside the root
+/// would otherwise read a file the template does not contain.
+fn walk(root: &Path, dir: &Path, out: &mut Vec<(String, Cow<'static, str>)>) -> Result<(), String> {
+    let entries =
+        std::fs::read_dir(dir).map_err(|e| format!("cannot read `{}`: {e}", dir.display()))?;
+
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("cannot read `{}`: {e}", dir.display()))?;
+        let path = entry.path();
+        let file_type = entry
+            .file_type()
+            .map_err(|e| format!("cannot stat `{}`: {e}", path.display()))?;
+
+        if file_type.is_symlink() {
+            continue;
+        }
+
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+
+        if file_type.is_dir() {
+            if !SKIPPED_DIRS.contains(&name.as_ref()) {
+                walk(root, &path, out)?;
+            }
+            continue;
+        }
+
+        let relative = path
+            .strip_prefix(root)
+            .map_err(|_| format!("`{}` is outside the template", path.display()))?
+            .to_string_lossy()
+            .replace('\\', "/");
+
+        let contents = std::fs::read_to_string(&path)
+            .map_err(|e| format!("cannot read `{relative}`: {e} (templates must be UTF-8 text)"))?;
+
+        out.push((relative, Cow::Owned(contents)));
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
 mod test {
     use super::*;
+
+    /// Build a throwaway directory template. Returns its root.
+    fn dir_with(files: &[(&str, &str)]) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "esp-generate-src-test-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        for (path, contents) in files {
+            let full = root.join(path);
+            std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+            std::fs::write(full, contents).unwrap();
+        }
+        root
+    }
+
+    #[test]
+    fn a_directory_reads_root_relative_paths() {
+        let root = dir_with(&[
+            ("metadata.toml", "sdk_version = \"0.1.0\"\n"),
+            ("src/bin/main.rs", "fn main() {}\n"),
+            (".vscode/settings.json", "{}\n"),
+        ]);
+        let source = TemplateSource::Directory(root.clone());
+
+        assert_eq!(
+            source.get("src/bin/main.rs").as_deref(),
+            Some("fn main() {}\n")
+        );
+        // Dotfiles are ordinary files, as in the bundled key space.
+        assert_eq!(source.get(".vscode/settings.json").as_deref(), Some("{}\n"));
+        assert_eq!(source.get("no/such/file"), None);
+
+        let paths: Vec<String> = source
+            .files()
+            .unwrap()
+            .into_iter()
+            .map(|(p, _)| p)
+            .collect();
+        assert_eq!(
+            paths,
+            [".vscode/settings.json", "metadata.toml", "src/bin/main.rs"],
+            "files() is sorted, so generation order does not follow the filesystem"
+        );
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A template directory is usually a checkout, so `.git` would otherwise be
+    /// read as template files — and its contents are not even UTF-8.
+    #[test]
+    fn a_directory_skips_git_and_target() {
+        let root = dir_with(&[
+            ("metadata.toml", "sdk_version = \"0.1.0\"\n"),
+            (".git/config", "[core]\n"),
+            ("target/debug/whatever", "junk\n"),
+        ]);
+        let source = TemplateSource::Directory(root.clone());
+
+        let paths: Vec<String> = source
+            .files()
+            .unwrap()
+            .into_iter()
+            .map(|(p, _)| p)
+            .collect();
+        assert_eq!(paths, ["metadata.toml"]);
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// An `include` that walks out of the template is refused before it reaches
+    /// the filesystem, so a directory source cannot be used to read the host.
+    #[test]
+    fn a_directory_refuses_a_path_that_escapes_it() {
+        let root = dir_with(&[("metadata.toml", "sdk_version = \"0.1.0\"\n")]);
+        let source = TemplateSource::Directory(root.clone());
+
+        for escape in ["../secret", "/etc/passwd", "a/../../b"] {
+            let err = source
+                .read(escape)
+                .expect_err("an escaping path must not be read");
+            assert!(err.contains("escapes"), "{escape}: {err}");
+        }
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
 
     #[test]
     fn the_bundled_source_resolves_root_relative_paths() {
@@ -75,12 +241,12 @@ mod test {
     #[test]
     fn files_agrees_with_get() {
         let source = TemplateSource::Bundled;
-        let files: Vec<_> = source.files().collect();
+        let files = source.files().unwrap();
 
         assert!(!files.is_empty(), "the bundled template is not empty");
         for (path, contents) in files {
             assert_eq!(
-                source.get(path),
+                source.get(&path),
                 Some(contents),
                 "`{path}` from `files()` must resolve through `get()`"
             );

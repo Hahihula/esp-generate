@@ -12,6 +12,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Add an optional coding-agent guidance template submenu for selecting `AGENTS.md`, `CLAUDE.md`, `CODEX.md`, or `GEMINI.md`. (#335)
 - Generated Xtensa projects now check for the required linker and point Unix users to source espup's export file when it is missing. (#343)
+- The TUI now also opens when no options were given on the command line at all. A template whose required groups are all satisfiable without input would otherwise generate straight from the defaults and never show the options it exists to offer. `--headless` is unaffected. (#357)
+- A required selection group that offers exactly one option is now picked automatically, in the TUI and headless alike. A board-specific template naming a single chip no longer makes you confirm the only answer before it will show you anything gated on it. A group with a real choice is still yours to make. (#357)
+- **Generate from an external template.** `--template <dir>` reads a template from a directory instead of the bundled one; it works with `list-options` and `explain` too. The directory is read with the same root-relative key space `build.rs` bakes in, `.git/` and `target/` are skipped, symlinks are not followed, and a path that escapes the template root is refused. Using one prints a warning, since a template decides what code and dependencies end up in your project. (#357)
 - Templates now carry a `metadata.toml` manifest. It declares the `esp-template-sdk` version the template is written against — checked before any template file is read, so an incompatible template fails with one clear line — and per-file `emit` rules: `when` is the condition a file is emitted under, `as` the path it is written to. A file with no rule is emitted as-is. (#357)
 
 ### Changed
